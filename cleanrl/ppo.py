@@ -69,6 +69,20 @@ class Args:
     target_kl: float = None
     """the target KL divergence threshold"""
 
+    # Rsubt stability certificate arguments
+    rsubt_monitor: bool = False
+    """if toggled, enables Rsubt stability certificate monitoring"""
+    rsubt_control: bool = False
+    """if toggled, enables risk-gated hyperparameter control based on Rsubt"""
+    rsubt_sketch_dim: int = 8192
+    """dimension of the sketch space for Rsubt"""
+    rsubt_buffer_size: int = 64
+    """number of updates to store in Rsubt buffer"""
+    rsubt_k_max: int = 20
+    """maximum number of eigenvalues to track"""
+    rsubt_diag_interval: int = 1
+    """compute Rsubt diagnostics every N iterations"""
+
     # to be filled in runtime
     batch_size: int = 0
     """the batch size (computed in runtime)"""
@@ -100,19 +114,28 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 class Agent(nn.Module):
     def __init__(self, envs):
         super().__init__()
-        self.critic = nn.Sequential(
-            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, 1), std=1.0),
-        )
+        obs_dim = np.array(envs.single_observation_space.shape).prod()
+        
+        # Critic with separate layers for activation extraction
+        self.critic_fc1 = layer_init(nn.Linear(obs_dim, 64))
+        self.critic_fc2 = layer_init(nn.Linear(64, 64))
+        self.critic_out = layer_init(nn.Linear(64, 1), std=1.0)
+        
+        # Actor with separate layers for activation extraction
+        self.actor_fc1 = layer_init(nn.Linear(obs_dim, 64))
+        self.actor_fc2 = layer_init(nn.Linear(64, 64))
+        self.actor_out = layer_init(nn.Linear(64, envs.single_action_space.n), std=0.01)
+        
+        # For backward compatibility
         self.actor = nn.Sequential(
-            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, envs.single_action_space.n), std=0.01),
+            self.actor_fc1, nn.Tanh(),
+            self.actor_fc2, nn.Tanh(),
+            self.actor_out
+        )
+        self.critic = nn.Sequential(
+            self.critic_fc1, nn.Tanh(),
+            self.critic_fc2, nn.Tanh(),
+            self.critic_out
         )
 
     def get_value(self, x):
@@ -124,6 +147,14 @@ class Agent(nn.Module):
         if action is None:
             action = probs.sample()
         return action, probs.log_prob(action), probs.entropy(), self.critic(x)
+    
+    def get_hidden_activations(self, x):
+        """Get hidden layer activations for representation rank computation."""
+        actor_h1 = torch.tanh(self.actor_fc1(x))
+        actor_h2 = torch.tanh(self.actor_fc2(actor_h1))
+        critic_h1 = torch.tanh(self.critic_fc1(x))
+        critic_h2 = torch.tanh(self.critic_fc2(critic_h1))
+        return actor_h2, critic_h2
 
 
 if __name__ == "__main__":
@@ -166,6 +197,27 @@ if __name__ == "__main__":
 
     agent = Agent(envs).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
+
+    # Rsubt stability certificate setup
+    rsubt_monitor = None
+    if args.rsubt_monitor:
+        from cleanrl_utils.rsubt import RsubtMonitor
+        # Get actor parameters
+        actor_params = list(agent.actor.parameters())
+        rsubt_monitor = RsubtMonitor(
+            params=actor_params,
+            sketch_dim=args.rsubt_sketch_dim,
+            buffer_size=args.rsubt_buffer_size,
+            k_max=args.rsubt_k_max,
+            diag_interval=args.rsubt_diag_interval,
+            algorithm="ppo",
+            device=device,
+            seed=args.seed,
+            enable_controller=args.rsubt_control,
+            base_lr=args.learning_rate,
+            base_epochs=args.update_epochs,
+            base_clip=args.clip_coef,
+        )
 
     # ALGO Logic: Storage setup
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
@@ -241,7 +293,23 @@ if __name__ == "__main__":
         # Optimizing the policy and value network
         b_inds = np.arange(args.batch_size)
         clipfracs = []
-        for epoch in range(args.update_epochs):
+
+        # Rsubt: snapshot actor params before optimization
+        if rsubt_monitor is not None:
+            actor_params = list(agent.actor.parameters())
+            rsubt_monitor.snapshot_params(actor_params)
+
+        # Rsubt: optionally apply risk-gated hyperparameters
+        current_update_epochs = args.update_epochs
+        current_clip_coef = args.clip_coef
+        if rsubt_monitor is not None and args.rsubt_control:
+            hp = rsubt_monitor.get_hyperparams()
+            if hp is not None:
+                current_update_epochs = hp.update_epochs
+                current_clip_coef = hp.clip_coef
+                optimizer.param_groups[0]["lr"] = hp.learning_rate
+
+        for epoch in range(current_update_epochs):
             np.random.shuffle(b_inds)
             for start in range(0, args.batch_size, args.minibatch_size):
                 end = start + args.minibatch_size
@@ -255,7 +323,7 @@ if __name__ == "__main__":
                     # calculate approx_kl http://joschu.net/blog/kl-approx.html
                     old_approx_kl = (-logratio).mean()
                     approx_kl = ((ratio - 1) - logratio).mean()
-                    clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
+                    clipfracs += [((ratio - 1.0).abs() > current_clip_coef).float().mean().item()]
 
                 mb_advantages = b_advantages[mb_inds]
                 if args.norm_adv:
@@ -263,7 +331,7 @@ if __name__ == "__main__":
 
                 # Policy loss
                 pg_loss1 = -mb_advantages * ratio
-                pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
+                pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - current_clip_coef, 1 + current_clip_coef)
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
                 # Value loss
@@ -286,11 +354,26 @@ if __name__ == "__main__":
 
                 optimizer.zero_grad()
                 loss.backward()
+                
+                # Compute gradient norms before clipping
+                actor_params_list = list(agent.actor.parameters())
+                critic_params_list = list(agent.critic.parameters())
+                grad_norm_actor = sum(p.grad.norm().item() ** 2 for p in actor_params_list if p.grad is not None) ** 0.5
+                grad_norm_critic = sum(p.grad.norm().item() ** 2 for p in critic_params_list if p.grad is not None) ** 0.5
+                
                 nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
                 optimizer.step()
 
             if args.target_kl is not None and approx_kl > args.target_kl:
                 break
+
+        # Rsubt: record update and compute certificate
+        if rsubt_monitor is not None:
+            actor_params = list(agent.actor.parameters())
+            rsubt_monitor.update(actor_params, global_step)
+            rsubt_metrics = rsubt_monitor.maybe_compute()
+            if rsubt_metrics is not None:
+                rsubt_monitor.log_to_tensorboard(writer, global_step)
 
         y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
         var_y = np.var(y_true)
@@ -305,6 +388,26 @@ if __name__ == "__main__":
         writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
         writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
         writer.add_scalar("losses/explained_variance", explained_var, global_step)
+        
+        # Baseline diagnostics: gradient norms
+        writer.add_scalar("baseline/grad_norm_actor", grad_norm_actor, global_step)
+        writer.add_scalar("baseline/grad_norm_critic", grad_norm_critic, global_step)
+        
+        # Representation rank diagnostics (every 10 iterations)
+        if args.rsubt_monitor and iteration % 10 == 0:
+            from cleanrl_utils.rsubt.reprank import compute_effective_rank, compute_stable_rank
+            with torch.no_grad():
+                sample_obs = b_obs[:256]
+                actor_hidden, critic_hidden = agent.get_hidden_activations(sample_obs)
+                actor_effrank = compute_effective_rank(actor_hidden)
+                actor_stablerank = compute_stable_rank(actor_hidden)
+                critic_effrank = compute_effective_rank(critic_hidden)
+                critic_stablerank = compute_stable_rank(critic_hidden)
+            writer.add_scalar("reprank/actor_effrank", actor_effrank, global_step)
+            writer.add_scalar("reprank/actor_stablerank", actor_stablerank, global_step)
+            writer.add_scalar("reprank/critic_effrank", critic_effrank, global_step)
+            writer.add_scalar("reprank/critic_stablerank", critic_stablerank, global_step)
+        
         print("SPS:", int(global_step / (time.time() - start_time)))
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 

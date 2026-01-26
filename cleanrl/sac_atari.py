@@ -73,6 +73,20 @@ class Args:
     target_entropy_scale: float = 0.89
     """coefficient for scaling the autotune entropy target"""
 
+    # Rsubt stability certificate arguments
+    rsubt_monitor: bool = False
+    """if toggled, enables Rsubt stability certificate monitoring"""
+    rsubt_control: bool = False
+    """if toggled, enables risk-gated hyperparameter control based on Rsubt"""
+    rsubt_sketch_dim: int = 32768
+    """dimension of the sketch space for Rsubt (larger for CNN)"""
+    rsubt_buffer_size: int = 32
+    """number of updates to store in Rsubt buffer"""
+    rsubt_k_max: int = 10
+    """maximum number of eigenvalues to track"""
+    rsubt_diag_interval: int = 10
+    """compute Rsubt diagnostics every N actor updates"""
+
 
 def make_env(env_id, seed, idx, capture_video, run_name):
     def thunk():
@@ -169,6 +183,12 @@ class Actor(nn.Module):
         action_probs = policy_dist.probs
         log_prob = F.log_softmax(logits, dim=1)
         return action, log_prob, action_probs
+    
+    def get_hidden(self, x):
+        """Get hidden layer activation for rank computation."""
+        h = F.relu(self.conv(x / 255.0))
+        h = F.relu(self.fc1(h))
+        return h
 
 
 if __name__ == "__main__":
@@ -214,6 +234,25 @@ if __name__ == "__main__":
     # TRY NOT TO MODIFY: eps=1e-4 increases numerical stability
     q_optimizer = optim.Adam(list(qf1.parameters()) + list(qf2.parameters()), lr=args.q_lr, eps=1e-4)
     actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.policy_lr, eps=1e-4)
+
+    # Rsubt stability certificate setup
+    rsubt_monitor = None
+    rsubt_actor_update_count = 0
+    if args.rsubt_monitor:
+        from cleanrl_utils.rsubt import RsubtMonitor
+        rsubt_monitor = RsubtMonitor(
+            params=list(actor.parameters()),
+            sketch_dim=args.rsubt_sketch_dim,
+            buffer_size=args.rsubt_buffer_size,
+            k_max=args.rsubt_k_max,
+            diag_interval=args.rsubt_diag_interval,
+            algorithm="sac",
+            device=device,
+            seed=args.seed,
+            enable_controller=args.rsubt_control,
+            base_lr=args.policy_lr,
+            base_policy_freq=1,  # SAC Atari doesn't use delayed actor updates
+        )
 
     # Automatic entropy tuning
     if args.autotune:
@@ -298,17 +337,42 @@ if __name__ == "__main__":
                 q_optimizer.step()
 
                 # ACTOR training
-                _, log_pi, action_probs = actor.get_action(data.observations)
-                with torch.no_grad():
-                    qf1_values = qf1(data.observations)
-                    qf2_values = qf2(data.observations)
-                    min_qf_values = torch.min(qf1_values, qf2_values)
-                # no need for reparameterization, the expectation can be calculated for discrete actions
-                actor_loss = (action_probs * ((alpha * log_pi) - min_qf_values)).mean()
+                # Rsubt: check if we should skip actor updates
+                skip_actor = False
+                if rsubt_monitor is not None and args.rsubt_control:
+                    hp = rsubt_monitor.get_hyperparams()
+                    if hp is not None and hp.skip_actor:
+                        skip_actor = True
+                        actor_optimizer.param_groups[0]["lr"] = hp.actor_lr
 
-                actor_optimizer.zero_grad()
-                actor_loss.backward()
-                actor_optimizer.step()
+                if not skip_actor:
+                    # Rsubt: snapshot actor params before update
+                    if rsubt_monitor is not None:
+                        rsubt_monitor.snapshot_params(list(actor.parameters()))
+
+                    _, log_pi, action_probs = actor.get_action(data.observations)
+                    with torch.no_grad():
+                        qf1_values = qf1(data.observations)
+                        qf2_values = qf2(data.observations)
+                        min_qf_values = torch.min(qf1_values, qf2_values)
+                    # no need for reparameterization, the expectation can be calculated for discrete actions
+                    actor_loss = (action_probs * ((alpha * log_pi) - min_qf_values)).mean()
+
+                    actor_optimizer.zero_grad()
+                    actor_loss.backward()
+                    
+                    # Compute gradient norm before step
+                    grad_norm_actor = sum(p.grad.norm().item() ** 2 for p in actor.parameters() if p.grad is not None) ** 0.5
+                    
+                    actor_optimizer.step()
+
+                    # Rsubt: record update and compute certificate
+                    if rsubt_monitor is not None:
+                        rsubt_actor_update_count += 1
+                        rsubt_monitor.update(list(actor.parameters()), global_step)
+                        rsubt_metrics = rsubt_monitor.maybe_compute()
+                        if rsubt_metrics is not None:
+                            rsubt_monitor.log_to_tensorboard(writer, global_step)
 
                 if args.autotune:
                     # reuse action probabilities for temperature loss
@@ -334,6 +398,21 @@ if __name__ == "__main__":
                 writer.add_scalar("losses/qf_loss", qf_loss.item() / 2.0, global_step)
                 writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
                 writer.add_scalar("losses/alpha", alpha, global_step)
+                
+                # Baseline diagnostics: gradient norms
+                if 'grad_norm_actor' in dir():
+                    writer.add_scalar("baseline/grad_norm_actor", grad_norm_actor, global_step)
+                
+                # Representation rank diagnostics
+                if args.rsubt_monitor and global_step % 1000 == 0:
+                    from cleanrl_utils.rsubt.reprank import compute_effective_rank, compute_stable_rank
+                    with torch.no_grad():
+                        actor_hidden = actor.get_hidden(data.observations)
+                        actor_effrank = compute_effective_rank(actor_hidden)
+                        actor_stablerank = compute_stable_rank(actor_hidden)
+                    writer.add_scalar("reprank/actor_effrank", actor_effrank, global_step)
+                    writer.add_scalar("reprank/actor_stablerank", actor_stablerank, global_step)
+                
                 print("SPS:", int(global_step / (time.time() - start_time)))
                 writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
                 if args.autotune:

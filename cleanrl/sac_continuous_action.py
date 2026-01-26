@@ -65,6 +65,20 @@ class Args:
     autotune: bool = True
     """automatic tuning of the entropy coefficient"""
 
+    # Rsubt stability certificate arguments
+    rsubt_monitor: bool = False
+    """if toggled, enables Rsubt stability certificate monitoring"""
+    rsubt_control: bool = False
+    """if toggled, enables risk-gated hyperparameter control based on Rsubt"""
+    rsubt_sketch_dim: int = 8192
+    """dimension of the sketch space for Rsubt"""
+    rsubt_buffer_size: int = 64
+    """number of updates to store in Rsubt buffer"""
+    rsubt_k_max: int = 20
+    """maximum number of eigenvalues to track"""
+    rsubt_diag_interval: int = 10
+    """compute Rsubt diagnostics every N actor updates"""
+
 
 def make_env(env_id, seed, idx, capture_video, run_name):
     def thunk():
@@ -149,6 +163,12 @@ class Actor(nn.Module):
         log_prob = log_prob.sum(1, keepdim=True)
         mean = torch.tanh(mean) * self.action_scale + self.action_bias
         return action, log_prob, mean
+    
+    def get_hidden(self, x):
+        """Get hidden layer activation for rank computation."""
+        h1 = F.relu(self.fc1(x))
+        h2 = F.relu(self.fc2(h1))
+        return h2
 
 
 if __name__ == "__main__":
@@ -198,6 +218,25 @@ if __name__ == "__main__":
     qf2_target.load_state_dict(qf2.state_dict())
     q_optimizer = optim.Adam(list(qf1.parameters()) + list(qf2.parameters()), lr=args.q_lr)
     actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.policy_lr)
+
+    # Rsubt stability certificate setup
+    rsubt_monitor = None
+    rsubt_actor_update_count = 0
+    if args.rsubt_monitor:
+        from cleanrl_utils.rsubt import RsubtMonitor
+        rsubt_monitor = RsubtMonitor(
+            params=list(actor.parameters()),
+            sketch_dim=args.rsubt_sketch_dim,
+            buffer_size=args.rsubt_buffer_size,
+            k_max=args.rsubt_k_max,
+            diag_interval=args.rsubt_diag_interval,
+            algorithm="sac",
+            device=device,
+            seed=args.seed,
+            enable_controller=args.rsubt_control,
+            base_lr=args.policy_lr,
+            base_policy_freq=args.policy_frequency,
+        )
 
     # Automatic entropy tuning
     if args.autotune:
@@ -273,28 +312,53 @@ if __name__ == "__main__":
             q_optimizer.step()
 
             if global_step % args.policy_frequency == 0:  # TD 3 Delayed update support
-                for _ in range(
-                    args.policy_frequency
-                ):  # compensate for the delay by doing 'actor_update_interval' instead of 1
-                    pi, log_pi, _ = actor.get_action(data.observations)
-                    qf1_pi = qf1(data.observations, pi)
-                    qf2_pi = qf2(data.observations, pi)
-                    min_qf_pi = torch.min(qf1_pi, qf2_pi)
-                    actor_loss = ((alpha * log_pi) - min_qf_pi).mean()
+                # Rsubt: check if we should skip actor updates
+                skip_actor = False
+                if rsubt_monitor is not None and args.rsubt_control:
+                    hp = rsubt_monitor.get_hyperparams()
+                    if hp is not None and hp.skip_actor:
+                        skip_actor = True
+                        actor_optimizer.param_groups[0]["lr"] = hp.actor_lr
 
-                    actor_optimizer.zero_grad()
-                    actor_loss.backward()
-                    actor_optimizer.step()
+                if not skip_actor:
+                    # Rsubt: snapshot actor params before update block
+                    if rsubt_monitor is not None:
+                        rsubt_monitor.snapshot_params(list(actor.parameters()))
 
-                    if args.autotune:
-                        with torch.no_grad():
-                            _, log_pi, _ = actor.get_action(data.observations)
-                        alpha_loss = (-log_alpha.exp() * (log_pi + target_entropy)).mean()
+                    for _ in range(
+                        args.policy_frequency
+                    ):  # compensate for the delay by doing 'actor_update_interval' instead of 1
+                        pi, log_pi, _ = actor.get_action(data.observations)
+                        qf1_pi = qf1(data.observations, pi)
+                        qf2_pi = qf2(data.observations, pi)
+                        min_qf_pi = torch.min(qf1_pi, qf2_pi)
+                        actor_loss = ((alpha * log_pi) - min_qf_pi).mean()
 
-                        a_optimizer.zero_grad()
-                        alpha_loss.backward()
-                        a_optimizer.step()
-                        alpha = log_alpha.exp().item()
+                        actor_optimizer.zero_grad()
+                        actor_loss.backward()
+                        
+                        # Compute gradient norm before step
+                        grad_norm_actor = sum(p.grad.norm().item() ** 2 for p in actor.parameters() if p.grad is not None) ** 0.5
+                        
+                        actor_optimizer.step()
+
+                        if args.autotune:
+                            with torch.no_grad():
+                                _, log_pi, _ = actor.get_action(data.observations)
+                            alpha_loss = (-log_alpha.exp() * (log_pi + target_entropy)).mean()
+
+                            a_optimizer.zero_grad()
+                            alpha_loss.backward()
+                            a_optimizer.step()
+                            alpha = log_alpha.exp().item()
+
+                    # Rsubt: record update and compute certificate
+                    if rsubt_monitor is not None:
+                        rsubt_actor_update_count += 1
+                        rsubt_monitor.update(list(actor.parameters()), global_step)
+                        rsubt_metrics = rsubt_monitor.maybe_compute()
+                        if rsubt_metrics is not None:
+                            rsubt_monitor.log_to_tensorboard(writer, global_step)
 
             # update the target networks
             if global_step % args.target_network_frequency == 0:
@@ -311,6 +375,21 @@ if __name__ == "__main__":
                 writer.add_scalar("losses/qf_loss", qf_loss.item() / 2.0, global_step)
                 writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
                 writer.add_scalar("losses/alpha", alpha, global_step)
+                
+                # Baseline diagnostics: gradient norms
+                if 'grad_norm_actor' in dir():
+                    writer.add_scalar("baseline/grad_norm_actor", grad_norm_actor, global_step)
+                
+                # Representation rank diagnostics
+                if args.rsubt_monitor and global_step % 1000 == 0:
+                    from cleanrl_utils.rsubt.reprank import compute_effective_rank, compute_stable_rank
+                    with torch.no_grad():
+                        actor_hidden = actor.get_hidden(data.observations)
+                        actor_effrank = compute_effective_rank(actor_hidden)
+                        actor_stablerank = compute_stable_rank(actor_hidden)
+                    writer.add_scalar("reprank/actor_effrank", actor_effrank, global_step)
+                    writer.add_scalar("reprank/actor_stablerank", actor_stablerank, global_step)
+                
                 print("SPS:", int(global_step / (time.time() - start_time)))
                 writer.add_scalar(
                     "charts/SPS",
