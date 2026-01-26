@@ -42,7 +42,7 @@ class EigenTracker:
         # Current eigenvalues and basis
         self.eigenvalues: torch.Tensor | None = None
         self.basis: torch.Tensor | None = None  # Basis in sketch space
-        self.projector: torch.Tensor | None = None  # Pi = U @ U.T
+        self.projector: torch.Tensor | None = None  # kept for backward compat; not materialized
     
     def update(self, sketches: torch.Tensor) -> dict:
         """
@@ -101,12 +101,12 @@ class EigenTracker:
         
         # Save previous for shock computation
         self.prev_basis = self.basis
-        self.prev_projector = self.projector
+        self.prev_projector = None
         
         # Update current
         self.eigenvalues = eigenvalues
         self.basis = basis_sketch  # sketch_dim × valid_k
-        self.projector = basis_sketch @ basis_sketch.T  # sketch_dim × sketch_dim
+        self.projector = None
         
         # Compute gap statistics
         gaps = []
@@ -142,7 +142,7 @@ class EigenTracker:
         Returns:
             Directional shock value in [0, 1].
         """
-        if self.projector is None or self.prev_projector is None:
+        if self.basis is None or self.prev_basis is None:
             return 0.0
         
         sketch = sketch.to(dtype=torch.float32, device=self.device)
@@ -151,13 +151,15 @@ class EigenTracker:
         if norm < 1e-12:
             return 0.0
         
-        # Compute (Π_t - Π_{t-1}) @ sketch
-        diff_proj = self.projector - self.prev_projector
-        projected = diff_proj @ sketch
+        # Compute (Π_t - Π_{t-1}) @ sketch without materializing projectors.
+        # Π v = U (U^T v)
+        proj_t = self.basis @ (self.basis.T @ sketch)
+        proj_prev = self.prev_basis @ (self.prev_basis.T @ sketch)
+        projected = proj_t - proj_prev
         
         shock = torch.norm(projected) / norm
         return shock.item()
     
     def has_previous(self) -> bool:
         """Check if we have a previous projector for shock computation."""
-        return self.prev_projector is not None
+        return self.prev_basis is not None

@@ -40,12 +40,22 @@ def run_experiment(command: str):
     command_list = shlex.split(command)
     print(f"running {command}")
 
-    # Use subprocess.PIPE to capture the output
+    # Capture subprocess output so we can surface it on failure without interleaving logs
+    # from multiple concurrent experiments.
     fd = subprocess.Popen(command_list, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     output, errors = fd.communicate()
 
     return_code = fd.returncode
-    assert return_code == 0, f"Command failed with error: {errors.decode('utf-8')}"
+    if return_code != 0:
+        stdout = output.decode("utf-8", errors="replace").strip()
+        stderr = errors.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(
+            "Command failed\n"
+            f"  cmd: {command}\n"
+            f"  returncode: {return_code}\n"
+            f"  stdout (tail):\n{os.linesep.join(stdout.splitlines()[-50:])}\n"
+            f"  stderr (tail):\n{os.linesep.join(stderr.splitlines()[-50:])}\n"
+        )
 
     # Convert bytes to string and strip leading/trailing whitespaces
     return output.decode("utf-8").strip()
@@ -108,12 +118,23 @@ if __name__ == "__main__":
         print(command)
 
     if args.workers > 0 and args.slurm_template_path is None:
-        from concurrent.futures import ThreadPoolExecutor
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
         executor = ThreadPoolExecutor(max_workers=args.workers, thread_name_prefix="cleanrl-benchmark-worker-")
-        for command in commands:
-            executor.submit(run_experiment, command)
+        futures = {executor.submit(run_experiment, command): command for command in commands}
+        failures = []
+        for fut in as_completed(futures):
+            command = futures[fut]
+            try:
+                fut.result()
+            except Exception as e:
+                # Collect failures so they aren't silently swallowed by ThreadPoolExecutor.
+                failures.append((command, e))
+                print(f"\nERROR: benchmark run failed for:\n  {command}\n{e}\n")
+
         executor.shutdown(wait=True)
+        if failures:
+            raise SystemExit(f"{len(failures)} experiment(s) failed; see errors above.")
     else:
         print("not running the experiments because --workers is set to 0; just printing the commands to run")
 
