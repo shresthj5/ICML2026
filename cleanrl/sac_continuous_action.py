@@ -88,6 +88,9 @@ def make_env(env_id, seed, idx, capture_video, run_name):
         else:
             env = gym.make(env_id)
         env = gym.wrappers.RecordEpisodeStatistics(env)
+        # Flatten Dict observations (e.g., from DMC environments)
+        if isinstance(env.observation_space, gym.spaces.Dict):
+            env = gym.wrappers.FlattenObservation(env)
         env.action_space.seed(seed)
         return env
 
