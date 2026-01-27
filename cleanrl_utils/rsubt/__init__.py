@@ -26,7 +26,7 @@ from cleanrl_utils.rsubt.sketch import Sketcher
 from cleanrl_utils.rsubt.buffer import UpdateBuffer
 from cleanrl_utils.rsubt.tracker import EigenTracker
 from cleanrl_utils.rsubt.certificate import RsubtCertificate, AlarmState
-from cleanrl_utils.rsubt.controller import RiskController, PPOHyperparams, SACHyperparams
+from cleanrl_utils.rsubt.controller import RiskController, PPOHyperparams, SACHyperparams, TD3Hyperparams
 from cleanrl_utils.rsubt.monitor import RsubtMonitor
 from cleanrl_utils.rsubt.reprank import (
     compute_effective_rank,
@@ -45,6 +45,7 @@ __all__ = [
     "RiskController",
     "PPOHyperparams",
     "SACHyperparams",
+    "TD3Hyperparams",
     "RsubtMonitor",
     # Rank diagnostics
     "compute_effective_rank",

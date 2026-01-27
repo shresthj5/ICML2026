@@ -32,7 +32,7 @@ atari = [
     "opencv-python>=4.6.0.66,<5",
     "shimmy>=1.1.0",
 ]
-envpool = ["envpool>=0.6.4,<0.7", "opencv-python>=4.6.0.66,<5",]
+envpool = ["envpool>=0.8.4", "opencv-python>=4.6.0.66,<5",]
 procgen = ["procgen>=0.10.7,<0.11"]
 mujoco = [
     "mujoco<=2.3.3",
@@ -50,11 +50,11 @@ pettingzoo = [
     "multi-agent-ale-py==0.1.11",
 ]
 jax = [
-    "jax==0.4.8",
-    "jaxlib==0.4.7",
-    "flax==0.6.8",
-    "optax==0.1.4",
-    "chex==0.1.5",
+    "jax>=0.4.8",
+    "jaxlib>=0.4.7",
+    "flax>=0.6.8",
+    "optax>=0.1.4",
+    "chex>=0.1.5",
     "scipy<1.13.0"
 ]
 optuna = [
@@ -92,3 +92,7 @@ include = [
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.uv]
+# Limit resolution to current platform and Python version to avoid jax issues
+environments = ["python_full_version >= '3.10' and python_full_version < '3.11' and sys_platform == 'linux' and platform_machine == 'x86_64'"]

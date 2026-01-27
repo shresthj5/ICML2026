@@ -77,10 +77,43 @@ class Args:
     rsubt_k_max: int = 20
     """maximum number of eigenvalues to track"""
     rsubt_diag_interval: int = 10
-    """compute Rsubt diagnostics every N actor updates"""
+    """DEPRECATED: compute Rsubt diagnostics every N actor updates (use diag_interval_steps instead)"""
+    rsubt_diag_interval_steps: int = 20480
+    """compute Rsubt diagnostics every N environment steps (step-based, consistent across num_envs)"""
+    rsubt_min_buffer_entries: int = 4
+    """minimum buffer entries before computing Rsubt (controls warmup speed)"""
+
+    # Periodic evaluation arguments
+    eval_interval_steps: int = 10000
+    """evaluate every N environment steps (0 to disable)"""
+    eval_episodes: int = 10
+    """number of episodes per evaluation"""
+    eval_seed: int = 12345
+    """fixed seed for evaluation reproducibility"""
+    eval_deterministic: bool = True
+    """use deterministic actions for evaluation"""
+
+    # Stress test arguments
+    stress_preset: str = ""
+    """stress test preset name (see cleanrl_utils.stress_wrappers.STRESS_PRESETS)"""
+    obs_noise_std: float = 0.0
+    """observation noise std (0 to disable)"""
+    obs_dropout_p: float = 0.0
+    """observation dropout probability (0 to disable)"""
+    action_delay: int = 0
+    """action delay in steps (0 to disable)"""
+    reward_scale: float = 1.0
+    """reward scaling factor"""
 
 
-def make_env(env_id, seed, idx, capture_video, run_name):
+def make_env(
+    env_id, seed, idx, capture_video, run_name,
+    stress_preset: str = "",
+    obs_noise_std: float = 0.0,
+    obs_dropout_p: float = 0.0,
+    action_delay: int = 0,
+    reward_scale: float = 1.0,
+):
     def thunk():
         if capture_video and idx == 0:
             env = gym.make(env_id, render_mode="rgb_array")
@@ -92,6 +125,28 @@ def make_env(env_id, seed, idx, capture_video, run_name):
         if isinstance(env.observation_space, gym.spaces.Dict):
             env = gym.wrappers.FlattenObservation(env)
         env.action_space.seed(seed)
+        
+        # Apply stress wrappers
+        if stress_preset or obs_noise_std > 0 or obs_dropout_p > 0 or action_delay > 0 or reward_scale != 1.0:
+            from cleanrl_utils.stress_wrappers import (
+                apply_stress_wrappers,
+                ObsNoiseWrapper,
+                ObsDropoutWrapper,
+                ActionDelayWrapper,
+                RewardScaleWrapper,
+            )
+            
+            if stress_preset:
+                env = apply_stress_wrappers(env, preset=stress_preset, seed=seed + idx)
+            if obs_noise_std > 0:
+                env = ObsNoiseWrapper(env, std=obs_noise_std, seed=seed + idx)
+            if obs_dropout_p > 0:
+                env = ObsDropoutWrapper(env, p=obs_dropout_p, seed=seed + idx)
+            if action_delay > 0:
+                env = ActionDelayWrapper(env, delay_steps=action_delay)
+            if reward_scale != 1.0:
+                env = RewardScaleWrapper(env, scale=reward_scale)
+        
         return env
 
     return thunk
@@ -206,7 +261,14 @@ if __name__ == "__main__":
 
     # env setup
     envs = gym.vector.SyncVectorEnv(
-        [make_env(args.env_id, args.seed + i, i, args.capture_video, run_name) for i in range(args.num_envs)]
+        [make_env(
+            args.env_id, args.seed + i, i, args.capture_video, run_name,
+            stress_preset=args.stress_preset,
+            obs_noise_std=args.obs_noise_std,
+            obs_dropout_p=args.obs_dropout_p,
+            action_delay=args.action_delay,
+            reward_scale=args.reward_scale,
+        ) for i in range(args.num_envs)]
     )
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
@@ -233,6 +295,8 @@ if __name__ == "__main__":
             buffer_size=args.rsubt_buffer_size,
             k_max=args.rsubt_k_max,
             diag_interval=args.rsubt_diag_interval,
+            diag_interval_steps=args.rsubt_diag_interval_steps,
+            min_buffer_entries=args.rsubt_min_buffer_entries,
             algorithm="sac",
             device=device,
             seed=args.seed,
@@ -249,6 +313,23 @@ if __name__ == "__main__":
         a_optimizer = optim.Adam([log_alpha], lr=args.q_lr)
     else:
         alpha = args.alpha
+
+    # Periodic evaluation setup
+    online_evaluator = None
+    last_eval_step = 0
+    if args.eval_interval_steps > 0:
+        from cleanrl_utils.evals.online_eval import OnlineEvaluator
+        online_evaluator = OnlineEvaluator(
+            make_env_fn=make_env,
+            env_id=args.env_id,
+            eval_episodes=args.eval_episodes,
+            eval_seed=args.eval_seed,
+            device=device,
+            deterministic=args.eval_deterministic,
+            gamma=args.gamma,
+            capture_video=False,
+            run_name=f"{run_name}-eval",
+        )
 
     envs.single_observation_space.dtype = np.float32
     rb = ReplayBuffer(
@@ -359,7 +440,7 @@ if __name__ == "__main__":
                     if rsubt_monitor is not None:
                         rsubt_actor_update_count += 1
                         rsubt_monitor.update(list(actor.parameters()), global_step)
-                        rsubt_metrics = rsubt_monitor.maybe_compute()
+                        rsubt_metrics = rsubt_monitor.maybe_compute(global_step)
                         if rsubt_metrics is not None:
                             rsubt_monitor.log_to_tensorboard(writer, global_step)
 
@@ -401,6 +482,17 @@ if __name__ == "__main__":
                 )
                 if args.autotune:
                     writer.add_scalar("losses/alpha_loss", alpha_loss.item(), global_step)
+
+        # Periodic evaluation
+        if online_evaluator is not None and (global_step - last_eval_step) >= args.eval_interval_steps:
+            eval_stats = online_evaluator.evaluate_offpolicy(actor, exploration_noise=0.0)
+            online_evaluator.log_to_tensorboard(writer, global_step, eval_stats)
+            print(f"eval: global_step={global_step}, return_mean={eval_stats.return_mean:.2f}, return_std={eval_stats.return_std:.2f}")
+            last_eval_step = global_step
+
+    # Close evaluator
+    if online_evaluator is not None:
+        online_evaluator.close()
 
     envs.close()
     writer.close()

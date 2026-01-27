@@ -2,15 +2,15 @@
 Evaluate early warning performance of Rsubt and baseline metrics.
 
 Reads TensorBoard event files and computes:
-- Collapse labels (binary)
+- Collapse labels (binary) using EMA-based definition
 - Alarm times for each metric
 - Lead time (how early the alarm fires before collapse)
 - TPR@FPR (true positive rate at fixed false positive rate)
-- AUC for "collapse within H steps" prediction
+- AUROC and AUPRC for "collapse within H steps" prediction
 
 Usage:
     python -m cleanrl_utils.rsubt.evaluate_early_warning \
-        --runs_dir runs/evaluation/ \
+        --runs_dir runs/test/ \
         --thresholds thresholds.json \
         --output results.json
 """
@@ -58,29 +58,57 @@ def load_scalar_from_events(
     return steps, values
 
 
-def detect_collapse(
+def compute_ema(values: list[float], alpha: float = 0.2) -> list[float]:
+    """Compute exponential moving average."""
+    if not values:
+        return []
+    ema = [values[0]]
+    for v in values[1:]:
+        ema.append(alpha * v + (1 - alpha) * ema[-1])
+    return ema
+
+
+def detect_collapse_ema(
     steps: list[int],
     returns: list[float],
-    threshold_ratio: float = 0.2,
-    consecutive_evals: int = 3,
+    ema_window: int = 5,
+    drop_ratio: float = 0.4,
+    persistence: int = 3,
 ) -> int | None:
-    """Detect collapse time from return history."""
-    if len(returns) < consecutive_evals:
+    """
+    Detect collapse time using EMA-based definition.
+    
+    Collapse is defined as:
+    - EMA(R(t)) <= (1 - drop_ratio) * R_best(t) for `persistence` consecutive evals.
+    """
+    if len(returns) < persistence:
         return None
     
-    max_return = float("-inf")
+    alpha = 2.0 / (ema_window + 1)
+    ema = compute_ema(returns, alpha)
+    
+    r_best = ema[0]
     low_count = 0
     
-    for i, (step, ret) in enumerate(zip(steps, returns)):
-        if ret > max_return:
-            max_return = ret
+    for i, (step, ema_val) in enumerate(zip(steps, ema)):
+        if ema_val > r_best:
+            r_best = ema_val
             low_count = 0
         else:
-            threshold = threshold_ratio * max_return
-            if max_return > 0 and ret < threshold:
+            if r_best > 0:
+                threshold = (1 - drop_ratio) * r_best
+                is_collapsed = ema_val < threshold
+            elif r_best < 0:
+                threshold = (1 + drop_ratio) * r_best
+                is_collapsed = ema_val < threshold
+            else:
+                threshold = -abs(drop_ratio)
+                is_collapsed = ema_val < threshold
+            
+            if is_collapsed:
                 low_count += 1
-                if low_count >= consecutive_evals:
-                    collapse_idx = i - consecutive_evals + 1
+                if low_count >= persistence:
+                    collapse_idx = i - persistence + 1
                     return steps[collapse_idx]
             else:
                 low_count = 0
@@ -133,7 +161,7 @@ def compute_lead_time(
     collapse_step: int | None,
     alarm_step: int | None,
 ) -> float | None:
-    """Compute lead time in steps."""
+    """Compute lead time in steps (positive = early warning)."""
     if collapse_step is None or alarm_step is None:
         return None
     
@@ -172,7 +200,8 @@ def evaluate_metric(
     lead_times = []
     
     for run in collapse_runs:
-        steps, values = run.get(f"{metric_key}_steps", []), run.get(f"{metric_key}_values", [])
+        steps = run.get(f"{metric_key}_steps", [])
+        values = run.get(f"{metric_key}_values", [])
         alarm_step = detect_alarm(steps, values, threshold, consecutive, higher_is_alarm)
         
         if alarm_step is not None and run["collapse_step"] is not None:
@@ -184,7 +213,8 @@ def evaluate_metric(
     # False positives: alarm in non-collapse runs
     false_positives = 0
     for run in non_collapse_runs:
-        steps, values = run.get(f"{metric_key}_steps", []), run.get(f"{metric_key}_values", [])
+        steps = run.get(f"{metric_key}_steps", [])
+        values = run.get(f"{metric_key}_values", [])
         alarm_step = detect_alarm(steps, values, threshold, consecutive, higher_is_alarm)
         if alarm_step is not None:
             false_positives += 1
@@ -197,8 +227,9 @@ def evaluate_metric(
     fpr = false_positives / n_non_collapse if n_non_collapse > 0 else 0.0
     
     # Lead time statistics
-    mean_lead = np.mean(lead_times) if lead_times else 0.0
-    median_lead = np.median(lead_times) if lead_times else 0.0
+    mean_lead = float(np.mean(lead_times)) if lead_times else 0.0
+    median_lead = float(np.median(lead_times)) if lead_times else 0.0
+    std_lead = float(np.std(lead_times)) if lead_times else 0.0
     
     return {
         "tpr": tpr,
@@ -209,18 +240,19 @@ def evaluate_metric(
         "n_non_collapse_runs": n_non_collapse,
         "mean_lead_time": mean_lead,
         "median_lead_time": median_lead,
+        "std_lead_time": std_lead,
         "lead_times": lead_times,
     }
 
 
-def compute_auc_collapse_prediction(
+def compute_auc_roc(
     runs: list[dict],
     metric_key: str,
     horizon_steps: int = 50000,
     higher_is_risk: bool = True,
 ) -> float:
     """
-    Compute AUC for "collapse within horizon" prediction.
+    Compute AUROC for "collapse within horizon" prediction.
     
     For each time point, treats the metric value as a score predicting
     whether collapse occurs within the next `horizon_steps`.
@@ -232,19 +264,20 @@ def compute_auc_collapse_prediction(
         higher_is_risk: If True, higher values predict collapse.
     
     Returns:
-        AUC score.
+        AUROC score.
     """
     all_scores = []
     all_labels = []
     
     for run in runs:
-        steps, values = run.get(f"{metric_key}_steps", []), run.get(f"{metric_key}_values", [])
+        steps = run.get(f"{metric_key}_steps", [])
+        values = run.get(f"{metric_key}_values", [])
         collapse_step = run["collapse_step"]
         
-        for i, (step, val) in enumerate(zip(steps, values)):
+        for step, val in zip(steps, values):
             # Label: will collapse within horizon?
             if collapse_step is not None:
-                label = 1 if (collapse_step - step) <= horizon_steps and (collapse_step - step) > 0 else 0
+                label = 1 if 0 < (collapse_step - step) <= horizon_steps else 0
             else:
                 label = 0
             
@@ -254,56 +287,125 @@ def compute_auc_collapse_prediction(
     if not all_scores or sum(all_labels) == 0 or sum(all_labels) == len(all_labels):
         return 0.5  # No valid AUC
     
-    # Simple AUC calculation via Mann-Whitney U statistic
-    from scipy import stats
+    try:
+        from sklearn.metrics import roc_auc_score
+        return float(roc_auc_score(all_labels, all_scores))
+    except ImportError:
+        # Fallback: Mann-Whitney U statistic
+        try:
+            from scipy import stats
+            positive_scores = [s for s, l in zip(all_scores, all_labels) if l == 1]
+            negative_scores = [s for s, l in zip(all_scores, all_labels) if l == 0]
+            if not positive_scores or not negative_scores:
+                return 0.5
+            statistic, _ = stats.mannwhitneyu(positive_scores, negative_scores, alternative="greater")
+            return float(statistic / (len(positive_scores) * len(negative_scores)))
+        except Exception:
+            return 0.5
+
+
+def compute_auc_pr(
+    runs: list[dict],
+    metric_key: str,
+    horizon_steps: int = 50000,
+    higher_is_risk: bool = True,
+) -> float:
+    """
+    Compute AUPRC (Area Under Precision-Recall Curve) for collapse prediction.
     
-    positive_scores = [s for s, l in zip(all_scores, all_labels) if l == 1]
-    negative_scores = [s for s, l in zip(all_scores, all_labels) if l == 0]
+    Args:
+        runs: List of run data dicts.
+        metric_key: Key for the metric.
+        horizon_steps: Prediction horizon.
+        higher_is_risk: If True, higher values predict collapse.
     
-    if not positive_scores or not negative_scores:
-        return 0.5
+    Returns:
+        AUPRC score.
+    """
+    all_scores = []
+    all_labels = []
+    
+    for run in runs:
+        steps = run.get(f"{metric_key}_steps", [])
+        values = run.get(f"{metric_key}_values", [])
+        collapse_step = run["collapse_step"]
+        
+        for step, val in zip(steps, values):
+            if collapse_step is not None:
+                label = 1 if 0 < (collapse_step - step) <= horizon_steps else 0
+            else:
+                label = 0
+            
+            all_scores.append(val if higher_is_risk else -val)
+            all_labels.append(label)
+    
+    if not all_scores or sum(all_labels) == 0 or sum(all_labels) == len(all_labels):
+        return 0.0
     
     try:
-        statistic, _ = stats.mannwhitneyu(positive_scores, negative_scores, alternative="greater")
-        auc = statistic / (len(positive_scores) * len(negative_scores))
-    except Exception:
-        auc = 0.5
-    
-    return float(auc)
+        from sklearn.metrics import average_precision_score
+        return float(average_precision_score(all_labels, all_scores))
+    except ImportError:
+        # Simple approximation
+        return 0.0
 
 
 def evaluate_all_metrics(
     runs_dir: str | Path,
-    thresholds: dict[str, float],
+    thresholds: dict[str, Any],
     metrics_config: dict[str, dict] | None = None,
+    return_key: str = "eval/return_mean",
+    ema_window: int = 5,
+    drop_ratio: float = 0.4,
+    persistence: int = 3,
+    horizon_steps: int = 50000,
 ) -> dict[str, Any]:
     """
     Evaluate all metrics across all runs.
     
     Args:
         runs_dir: Directory containing run subdirectories.
-        thresholds: Dict with threshold values.
+        thresholds: Dict with threshold values from calibration.
         metrics_config: Configuration for each metric (key, threshold, direction).
+        return_key: TensorBoard key for returns.
+        ema_window: EMA window for collapse detection.
+        drop_ratio: Drop ratio for collapse detection.
+        persistence: Persistence for collapse detection.
+        horizon_steps: Prediction horizon for AUC computation.
     
     Returns:
         Results dictionary.
     """
     runs_dir = Path(runs_dir)
     
-    # Default metrics to evaluate
+    # Build metrics config from thresholds
     if metrics_config is None:
-        tau_y = thresholds.get("tau_yellow", 0.5)
-        tau_r = thresholds.get("tau_red", 1.0)
+        metrics_config = {}
         
-        metrics_config = {
-            "rsubt/ewma": {"threshold": tau_y, "higher_is_alarm": True},
-            "rsubt/shock": {"threshold": tau_y, "higher_is_alarm": True},
-            "losses/approx_kl": {"threshold": 0.02, "higher_is_alarm": True},
-            "losses/value_loss": {"threshold": 100.0, "higher_is_alarm": True},
-            "losses/entropy": {"threshold": 0.1, "higher_is_alarm": False},
-            "baseline/grad_norm_actor": {"threshold": 10.0, "higher_is_alarm": True},
-            "reprank/actor_stablerank": {"threshold": 5.0, "higher_is_alarm": False},
-        }
+        # Add Rsubt metrics
+        if "metrics" in thresholds:
+            for metric_name, metric_thresholds in thresholds["metrics"].items():
+                # Determine direction based on metric name
+                higher_is_alarm = True
+                if "entropy" in metric_name.lower() or "stablerank" in metric_name.lower():
+                    higher_is_alarm = False
+                
+                metrics_config[metric_name] = {
+                    "threshold": metric_thresholds["tau_yellow"],
+                    "higher_is_alarm": higher_is_alarm,
+                }
+        else:
+            # Legacy format
+            tau_y = thresholds.get("tau_yellow", 0.5)
+            metrics_config = {
+                "rsubt/ewma": {"threshold": tau_y, "higher_is_alarm": True},
+                "rsubt/shock": {"threshold": tau_y, "higher_is_alarm": True},
+                "losses/approx_kl": {"threshold": 0.02, "higher_is_alarm": True},
+                "losses/value_loss": {"threshold": 100.0, "higher_is_alarm": True},
+                "losses/entropy": {"threshold": 0.1, "higher_is_alarm": False},
+                "baseline/grad_norm_actor": {"threshold": 10.0, "higher_is_alarm": True},
+                "reprank/actor_stablerank": {"threshold": 5.0, "higher_is_alarm": False},
+            }
     
     # Load all runs
     runs = []
@@ -314,8 +416,17 @@ def evaluate_all_metrics(
         run_data = {"name": run_dir.name}
         
         # Load returns and detect collapse
-        return_steps, return_values = load_scalar_from_events(run_dir, "charts/episodic_return")
-        run_data["collapse_step"] = detect_collapse(return_steps, return_values)
+        return_steps, return_values = load_scalar_from_events(run_dir, return_key)
+        if not return_values:
+            # Fallback to training returns
+            return_steps, return_values = load_scalar_from_events(run_dir, "charts/episodic_return")
+        
+        run_data["collapse_step"] = detect_collapse_ema(
+            return_steps, return_values,
+            ema_window=ema_window,
+            drop_ratio=drop_ratio,
+            persistence=persistence,
+        )
         
         # Load all metrics
         for metric_key in metrics_config.keys():
@@ -343,31 +454,63 @@ def evaluate_all_metrics(
             higher_is_alarm=config["higher_is_alarm"],
         )
         
-        # Compute AUC
+        # Compute AUROC
         try:
-            auc = compute_auc_collapse_prediction(
+            auroc = compute_auc_roc(
                 runs, metric_key,
+                horizon_steps=horizon_steps,
                 higher_is_risk=config["higher_is_alarm"],
             )
-            metric_results["auc"] = auc
-        except ImportError:
-            metric_results["auc"] = None
-            print("  Warning: scipy not available for AUC computation")
+            metric_results["auroc"] = auroc
+        except Exception:
+            metric_results["auroc"] = None
+        
+        # Compute AUPRC
+        try:
+            auprc = compute_auc_pr(
+                runs, metric_key,
+                horizon_steps=horizon_steps,
+                higher_is_risk=config["higher_is_alarm"],
+            )
+            metric_results["auprc"] = auprc
+        except Exception:
+            metric_results["auprc"] = None
         
         results["metrics"][metric_key] = metric_results
         
         print(f"  TPR: {metric_results['tpr']:.3f}")
         print(f"  FPR: {metric_results['fpr']:.3f}")
-        print(f"  Mean lead time: {metric_results['mean_lead_time']:.0f}")
-        if metric_results.get("auc") is not None:
-            print(f"  AUC: {metric_results['auc']:.3f}")
+        print(f"  Mean lead time: {metric_results['mean_lead_time']:.0f} steps")
+        if metric_results.get("auroc") is not None:
+            print(f"  AUROC: {metric_results['auroc']:.3f}")
+        if metric_results.get("auprc") is not None:
+            print(f"  AUPRC: {metric_results['auprc']:.3f}")
     
     # Summary statistics
     results["summary"] = {
         "n_runs": len(runs),
         "n_collapse_runs": n_collapse,
         "n_non_collapse_runs": len(runs) - n_collapse,
+        "horizon_steps": horizon_steps,
+        "collapse_config": {
+            "ema_window": ema_window,
+            "drop_ratio": drop_ratio,
+            "persistence": persistence,
+        },
     }
+    
+    # Ranking of metrics by AUROC
+    if any(m.get("auroc") is not None for m in results["metrics"].values()):
+        ranking = sorted(
+            [(k, v.get("auroc", 0)) for k, v in results["metrics"].items()],
+            key=lambda x: x[1] if x[1] is not None else 0,
+            reverse=True,
+        )
+        print("\n=== Metric Ranking by AUROC ===")
+        for i, (metric, auroc) in enumerate(ranking, 1):
+            if auroc is not None:
+                print(f"  {i}. {metric}: {auroc:.3f}")
+        results["ranking_auroc"] = ranking
     
     return results
 
@@ -392,6 +535,22 @@ def main():
         "--horizon", type=int, default=50000,
         help="Prediction horizon in steps for AUC computation"
     )
+    parser.add_argument(
+        "--return_key", type=str, default="eval/return_mean",
+        help="TensorBoard key for returns"
+    )
+    parser.add_argument(
+        "--ema_window", type=int, default=5,
+        help="EMA window for collapse detection"
+    )
+    parser.add_argument(
+        "--drop_ratio", type=float, default=0.4,
+        help="Drop ratio for collapse detection"
+    )
+    parser.add_argument(
+        "--persistence", type=int, default=3,
+        help="Persistence for collapse detection"
+    )
     
     args = parser.parse_args()
     
@@ -403,9 +562,16 @@ def main():
         print("No thresholds file provided, using defaults")
         thresholds = {"tau_yellow": 0.5, "tau_red": 1.0}
     
-    results = evaluate_all_metrics(args.runs_dir, thresholds)
+    results = evaluate_all_metrics(
+        args.runs_dir,
+        thresholds,
+        return_key=args.return_key,
+        ema_window=args.ema_window,
+        drop_ratio=args.drop_ratio,
+        persistence=args.persistence,
+        horizon_steps=args.horizon,
+    )
     
-    # Save results
     # Convert numpy arrays to lists for JSON serialization
     def convert_for_json(obj):
         if isinstance(obj, np.ndarray):

@@ -69,8 +69,55 @@ class Args:
     noise_clip: float = 0.5
     """noise clip parameter of the Target Policy Smoothing Regularization"""
 
+    # Rsubt stability certificate arguments
+    rsubt_monitor: bool = False
+    """if toggled, enables Rsubt stability certificate monitoring"""
+    rsubt_control: bool = False
+    """if toggled, enables risk-gated hyperparameter control based on Rsubt"""
+    rsubt_sketch_dim: int = 8192
+    """dimension of the sketch space for Rsubt"""
+    rsubt_buffer_size: int = 64
+    """number of updates to store in Rsubt buffer"""
+    rsubt_k_max: int = 20
+    """maximum number of eigenvalues to track"""
+    rsubt_diag_interval: int = 10
+    """DEPRECATED: compute Rsubt diagnostics every N actor updates (use diag_interval_steps instead)"""
+    rsubt_diag_interval_steps: int = 20480
+    """compute Rsubt diagnostics every N environment steps (step-based, consistent across num_envs)"""
+    rsubt_min_buffer_entries: int = 4
+    """minimum buffer entries before computing Rsubt (controls warmup speed)"""
 
-def make_env(env_id, seed, idx, capture_video, run_name):
+    # Periodic evaluation arguments
+    eval_interval_steps: int = 10000
+    """evaluate every N environment steps (0 to disable)"""
+    eval_episodes: int = 10
+    """number of episodes per evaluation"""
+    eval_seed: int = 12345
+    """fixed seed for evaluation reproducibility"""
+    eval_deterministic: bool = True
+    """use deterministic actions for evaluation"""
+
+    # Stress test arguments
+    stress_preset: str = ""
+    """stress test preset name (see cleanrl_utils.stress_wrappers.STRESS_PRESETS)"""
+    obs_noise_std: float = 0.0
+    """observation noise std (0 to disable)"""
+    obs_dropout_p: float = 0.0
+    """observation dropout probability (0 to disable)"""
+    action_delay: int = 0
+    """action delay in steps (0 to disable)"""
+    reward_scale: float = 1.0
+    """reward scaling factor"""
+
+
+def make_env(
+    env_id, seed, idx, capture_video, run_name,
+    stress_preset: str = "",
+    obs_noise_std: float = 0.0,
+    obs_dropout_p: float = 0.0,
+    action_delay: int = 0,
+    reward_scale: float = 1.0,
+):
     def thunk():
         if capture_video and idx == 0:
             env = gym.make(env_id, render_mode="rgb_array")
@@ -79,6 +126,28 @@ def make_env(env_id, seed, idx, capture_video, run_name):
             env = gym.make(env_id)
         env = gym.wrappers.RecordEpisodeStatistics(env)
         env.action_space.seed(seed)
+        
+        # Apply stress wrappers
+        if stress_preset or obs_noise_std > 0 or obs_dropout_p > 0 or action_delay > 0 or reward_scale != 1.0:
+            from cleanrl_utils.stress_wrappers import (
+                apply_stress_wrappers,
+                ObsNoiseWrapper,
+                ObsDropoutWrapper,
+                ActionDelayWrapper,
+                RewardScaleWrapper,
+            )
+            
+            if stress_preset:
+                env = apply_stress_wrappers(env, preset=stress_preset, seed=seed + idx)
+            if obs_noise_std > 0:
+                env = ObsNoiseWrapper(env, std=obs_noise_std, seed=seed + idx)
+            if obs_dropout_p > 0:
+                env = ObsDropoutWrapper(env, p=obs_dropout_p, seed=seed + idx)
+            if action_delay > 0:
+                env = ActionDelayWrapper(env, delay_steps=action_delay)
+            if reward_scale != 1.0:
+                env = RewardScaleWrapper(env, scale=reward_scale)
+        
         return env
 
     return thunk
@@ -131,6 +200,12 @@ class Actor(nn.Module):
         x = torch.tanh(self.fc_mu(x))
         return x * self.action_scale + self.action_bias
 
+    def get_hidden(self, x):
+        """Get hidden layer activation for rank computation."""
+        h1 = F.relu(self.fc1(x))
+        h2 = F.relu(self.fc2(h1))
+        return h2
+
 
 if __name__ == "__main__":
 
@@ -164,7 +239,14 @@ if __name__ == "__main__":
 
     # env setup
     envs = gym.vector.SyncVectorEnv(
-        [make_env(args.env_id, args.seed + i, i, args.capture_video, run_name) for i in range(args.num_envs)]
+        [make_env(
+            args.env_id, args.seed + i, i, args.capture_video, run_name,
+            stress_preset=args.stress_preset,
+            obs_noise_std=args.obs_noise_std,
+            obs_dropout_p=args.obs_dropout_p,
+            action_delay=args.action_delay,
+            reward_scale=args.reward_scale,
+        ) for i in range(args.num_envs)]
     )
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
@@ -180,6 +262,45 @@ if __name__ == "__main__":
     q_optimizer = optim.Adam(list(qf1.parameters()) + list(qf2.parameters()), lr=args.learning_rate)
     actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.learning_rate)
 
+    # Rsubt stability certificate setup
+    rsubt_monitor = None
+    rsubt_actor_update_count = 0
+    if args.rsubt_monitor:
+        from cleanrl_utils.rsubt import RsubtMonitor
+        rsubt_monitor = RsubtMonitor(
+            params=list(actor.parameters()),
+            sketch_dim=args.rsubt_sketch_dim,
+            buffer_size=args.rsubt_buffer_size,
+            k_max=args.rsubt_k_max,
+            diag_interval=args.rsubt_diag_interval,
+            diag_interval_steps=args.rsubt_diag_interval_steps,
+            min_buffer_entries=args.rsubt_min_buffer_entries,
+            algorithm="td3",
+            device=device,
+            seed=args.seed,
+            enable_controller=args.rsubt_control,
+            base_lr=args.learning_rate,
+            base_policy_freq=args.policy_frequency,
+            base_exploration_noise=args.exploration_noise,
+        )
+
+    # Periodic evaluation setup
+    online_evaluator = None
+    last_eval_step = 0
+    if args.eval_interval_steps > 0:
+        from cleanrl_utils.evals.online_eval import OnlineEvaluator
+        online_evaluator = OnlineEvaluator(
+            make_env_fn=make_env,
+            env_id=args.env_id,
+            eval_episodes=args.eval_episodes,
+            eval_seed=args.eval_seed,
+            device=device,
+            deterministic=args.eval_deterministic,
+            gamma=args.gamma,
+            capture_video=False,
+            run_name=f"{run_name}-eval",
+        )
+
     envs.single_observation_space.dtype = np.float32
     rb = ReplayBuffer(
         args.buffer_size,
@@ -191,6 +312,9 @@ if __name__ == "__main__":
     )
     start_time = time.time()
 
+    # Track current exploration noise (can be adjusted by Rsubt controller)
+    current_exploration_noise = args.exploration_noise
+
     # TRY NOT TO MODIFY: start the game
     obs, _ = envs.reset(seed=args.seed)
     for global_step in range(args.total_timesteps):
@@ -200,7 +324,7 @@ if __name__ == "__main__":
         else:
             with torch.no_grad():
                 actions = actor(torch.Tensor(obs).to(device))
-                actions += torch.normal(0, actor.action_scale * args.exploration_noise)
+                actions += torch.normal(0, actor.action_scale * current_exploration_noise)
                 actions = actions.cpu().numpy().clip(envs.single_action_space.low, envs.single_action_space.high)
 
         # TRY NOT TO MODIFY: execute the game and log data.
@@ -253,10 +377,37 @@ if __name__ == "__main__":
             q_optimizer.step()
 
             if global_step % args.policy_frequency == 0:
-                actor_loss = -qf1(data.observations, actor(data.observations)).mean()
-                actor_optimizer.zero_grad()
-                actor_loss.backward()
-                actor_optimizer.step()
+                # Rsubt: check if we should skip actor updates
+                skip_actor = False
+                if rsubt_monitor is not None and args.rsubt_control:
+                    hp = rsubt_monitor.get_hyperparams()
+                    if hp is not None:
+                        if hp.skip_actor:
+                            skip_actor = True
+                        actor_optimizer.param_groups[0]["lr"] = hp.actor_lr
+                        current_exploration_noise = hp.exploration_noise
+
+                if not skip_actor:
+                    # Rsubt: snapshot actor params before update
+                    if rsubt_monitor is not None:
+                        rsubt_monitor.snapshot_params(list(actor.parameters()))
+
+                    actor_loss = -qf1(data.observations, actor(data.observations)).mean()
+                    actor_optimizer.zero_grad()
+                    actor_loss.backward()
+                    
+                    # Compute gradient norm before step
+                    grad_norm_actor = sum(p.grad.norm().item() ** 2 for p in actor.parameters() if p.grad is not None) ** 0.5
+                    
+                    actor_optimizer.step()
+
+                    # Rsubt: record update and compute certificate
+                    if rsubt_monitor is not None:
+                        rsubt_actor_update_count += 1
+                        rsubt_monitor.update(list(actor.parameters()), global_step)
+                        rsubt_metrics = rsubt_monitor.maybe_compute(global_step)
+                        if rsubt_metrics is not None:
+                            rsubt_monitor.log_to_tensorboard(writer, global_step)
 
                 # update the target network
                 for param, target_param in zip(actor.parameters(), target_actor.parameters()):
@@ -273,12 +424,38 @@ if __name__ == "__main__":
                 writer.add_scalar("losses/qf2_loss", qf2_loss.item(), global_step)
                 writer.add_scalar("losses/qf_loss", qf_loss.item() / 2.0, global_step)
                 writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
+                
+                # Baseline diagnostics: gradient norms
+                if 'grad_norm_actor' in dir():
+                    writer.add_scalar("baseline/grad_norm_actor", grad_norm_actor, global_step)
+                
+                # Representation rank diagnostics
+                if args.rsubt_monitor and global_step % 1000 == 0:
+                    from cleanrl_utils.rsubt.reprank import compute_effective_rank, compute_stable_rank
+                    with torch.no_grad():
+                        actor_hidden = actor.get_hidden(data.observations)
+                        actor_effrank = compute_effective_rank(actor_hidden)
+                        actor_stablerank = compute_stable_rank(actor_hidden)
+                    writer.add_scalar("reprank/actor_effrank", actor_effrank, global_step)
+                    writer.add_scalar("reprank/actor_stablerank", actor_stablerank, global_step)
+                
                 print("SPS:", int(global_step / (time.time() - start_time)))
                 writer.add_scalar(
                     "charts/SPS",
                     int(global_step / (time.time() - start_time)),
                     global_step,
                 )
+
+        # Periodic evaluation
+        if online_evaluator is not None and (global_step - last_eval_step) >= args.eval_interval_steps:
+            eval_stats = online_evaluator.evaluate_offpolicy(actor, exploration_noise=0.0)
+            online_evaluator.log_to_tensorboard(writer, global_step, eval_stats)
+            print(f"eval: global_step={global_step}, return_mean={eval_stats.return_mean:.2f}, return_std={eval_stats.return_std:.2f}")
+            last_eval_step = global_step
+
+    # Close evaluator
+    if online_evaluator is not None:
+        online_evaluator.close()
 
     if args.save_model:
         model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"

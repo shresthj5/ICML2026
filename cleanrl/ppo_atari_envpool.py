@@ -15,6 +15,8 @@ import tyro
 from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
 
+from cleanrl_utils.envpool_stress import apply_stress_preset_to_args
+
 
 @dataclass
 class Args:
@@ -71,6 +73,44 @@ class Args:
     target_kl: float = None
     """the target KL divergence threshold"""
 
+    # Rsubt stability certificate arguments
+    rsubt_monitor: bool = False
+    """if toggled, enables Rsubt stability certificate monitoring"""
+    rsubt_control: bool = False
+    """if toggled, enables risk-gated hyperparameter control based on Rsubt"""
+    rsubt_sketch_dim: int = 32768
+    """dimension of the sketch space for Rsubt (larger for CNN)"""
+    rsubt_buffer_size: int = 32
+    """number of updates to store in Rsubt buffer"""
+    rsubt_k_max: int = 10
+    """maximum number of eigenvalues to track"""
+    rsubt_diag_interval: int = 10
+    """DEPRECATED: compute Rsubt diagnostics every N iterations (use diag_interval_steps instead)"""
+    rsubt_diag_interval_steps: int = 20480
+    """compute Rsubt diagnostics every N environment steps (step-based, consistent across num_envs)"""
+    rsubt_min_buffer_entries: int = 4
+    """minimum buffer entries before computing Rsubt (controls warmup speed)"""
+
+    # Periodic evaluation arguments
+    eval_interval_steps: int = 50000
+    """evaluate every N environment steps (0 to disable)"""
+    eval_episodes: int = 10
+    """number of episodes per evaluation"""
+    eval_seed: int = 12345
+    """fixed seed for evaluation reproducibility"""
+    eval_deterministic: bool = True
+    """use deterministic (argmax) actions for evaluation"""
+
+    # Stress test arguments
+    stress_preset: str = ""
+    """stress test preset name (see cleanrl_utils.stress_wrappers.STRESS_PRESETS)"""
+    obs_noise_std: float = 0.0
+    """observation noise std in normalized space (0..1); applied as noise*255 before model input"""
+    action_delay: int = 0
+    """action delay in steps (0 to disable)"""
+    reward_scale: float = 1.0
+    """reward scaling factor"""
+
     # to be filled in runtime
     batch_size: int = 0
     """the batch size (computed in runtime)"""
@@ -114,6 +154,81 @@ class RecordEpisodeStatistics(gym.Wrapper):
         )
 
 
+class StressTransforms:
+    """Array-level stress transforms for EnvPool Atari PPO."""
+
+    def __init__(self, num_envs: int, obs_noise_std: float, action_delay: int, reward_scale: float, seed: int):
+        self.num_envs = num_envs
+        self.obs_noise_std = float(obs_noise_std)
+        self.action_delay = int(action_delay)
+        self.reward_scale = float(reward_scale)
+        self.rng = np.random.default_rng(seed)
+        if self.action_delay > 0:
+            # queue of actions; each element is (num_envs,) int array
+            self._action_queue = [None] * self.action_delay
+        else:
+            self._action_queue = None
+
+    def apply_obs_noise_pixels(self, obs_tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Apply Gaussian obs noise in normalized space [0,1] by adding (noise*255) to pixel tensor.
+        This preserves the existing Agent behavior (it divides by 255 internally).
+        """
+        if self.obs_noise_std <= 0:
+            return obs_tensor
+        noise = self.rng.normal(0.0, self.obs_noise_std, size=obs_tensor.shape).astype(np.float32)
+        noise_t = torch.from_numpy(noise).to(obs_tensor.device) * 255.0
+        out = obs_tensor + noise_t
+        return torch.clamp(out, 0.0, 255.0)
+
+    def delay_action(self, action_np: np.ndarray) -> np.ndarray:
+        if self._action_queue is None:
+            return action_np
+        if self._action_queue[0] is None:
+            for i in range(len(self._action_queue)):
+                self._action_queue[i] = np.zeros_like(action_np)
+        delayed = self._action_queue[0]
+        self._action_queue = self._action_queue[1:] + [action_np.copy()]
+        return delayed
+
+    def scale_reward(self, reward: np.ndarray) -> np.ndarray:
+        if self.reward_scale == 1.0:
+            return reward
+        return reward * self.reward_scale
+
+
+def evaluate_atari_envpool(actor: nn.Module, env_id: str, episodes: int, seed: int, device: torch.device, deterministic: bool) -> tuple[float, float, float]:
+    """Evaluate policy on EnvPool Atari with episodic_life=False and reward_clip=False."""
+    env = envpool.make(env_id, env_type="gym", num_envs=1, seed=seed, episodic_life=False, reward_clip=False)
+    returns = []
+    lengths = []
+    for ep in range(episodes):
+        obs = env.reset()
+        done = False
+        ep_ret = 0.0
+        ep_len = 0
+        while not done:
+            obs_t = torch.tensor(obs, device=device, dtype=torch.float32)
+            with torch.no_grad():
+                logits = actor.get_action_and_value(obs_t)[0]  # action
+                # If deterministic: argmax over logits; else sampling already happened.
+                if deterministic:
+                    # Recompute logits deterministically
+                    hidden = actor.network(obs_t / 255.0)
+                    raw_logits = actor.actor(hidden)
+                    action = torch.argmax(raw_logits, dim=1)
+                else:
+                    action = logits
+            obs, rew, done_arr, _info = env.step(action.cpu().numpy())
+            done = bool(done_arr[0])
+            ep_ret += float(rew[0])
+            ep_len += 1
+        returns.append(ep_ret)
+        lengths.append(ep_len)
+    env.close()
+    return float(np.mean(returns)), float(np.std(returns)), float(np.mean(lengths))
+
+
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
     torch.nn.init.constant_(layer.bias, bias_const)
@@ -151,6 +266,7 @@ class Agent(nn.Module):
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
+    apply_stress_preset_to_args(args)
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
@@ -172,6 +288,7 @@ if __name__ == "__main__":
         "hyperparameters",
         "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
+    writer.add_text("original_env_id", args.env_id)
 
     # TRY NOT TO MODIFY: seeding
     random.seed(args.seed)
@@ -199,6 +316,39 @@ if __name__ == "__main__":
     agent = Agent(envs).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
+    # Stress transforms + episode tracking for true game-over returns
+    stress = StressTransforms(
+        num_envs=args.num_envs,
+        obs_noise_std=args.obs_noise_std,
+        action_delay=args.action_delay,
+        reward_scale=args.reward_scale,
+        seed=args.seed,
+    )
+    ep_returns = np.zeros(args.num_envs, dtype=np.float32)
+    ep_lengths = np.zeros(args.num_envs, dtype=np.int32)
+
+    # Rsubt stability certificate setup
+    rsubt_monitor = None
+    if args.rsubt_monitor:
+        from cleanrl_utils.rsubt import RsubtMonitor
+        actor_params = list(agent.network.parameters()) + list(agent.actor.parameters())
+        rsubt_monitor = RsubtMonitor(
+            params=actor_params,
+            sketch_dim=args.rsubt_sketch_dim,
+            buffer_size=args.rsubt_buffer_size,
+            k_max=args.rsubt_k_max,
+            diag_interval=args.rsubt_diag_interval,
+            diag_interval_steps=args.rsubt_diag_interval_steps,
+            min_buffer_entries=args.rsubt_min_buffer_entries,
+            algorithm="ppo",
+            device=device,
+            seed=args.seed,
+            enable_controller=args.rsubt_control,
+            base_lr=args.learning_rate,
+            base_epochs=args.update_epochs,
+            base_clip=args.clip_coef,
+        )
+
     # ALGO Logic: Storage setup
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
     actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
@@ -213,6 +363,7 @@ if __name__ == "__main__":
     start_time = time.time()
     next_obs = torch.Tensor(envs.reset()).to(device)
     next_done = torch.zeros(args.num_envs).to(device)
+    last_eval_step = 0
 
     for iteration in range(1, args.num_iterations + 1):
         # Annealing the rate if instructed to do so.
@@ -223,28 +374,38 @@ if __name__ == "__main__":
 
         for step in range(0, args.num_steps):
             global_step += args.num_envs
-            obs[step] = next_obs
+            # Apply obs noise stress in pixel space before storage and policy
+            noisy_obs = stress.apply_obs_noise_pixels(next_obs)
+            obs[step] = noisy_obs
             dones[step] = next_done
 
             # ALGO LOGIC: action logic
             with torch.no_grad():
-                action, logprob, _, value = agent.get_action_and_value(next_obs)
+                action, logprob, _, value = agent.get_action_and_value(noisy_obs)
                 values[step] = value.flatten()
             actions[step] = action
             logprobs[step] = logprob
 
             # TRY NOT TO MODIFY: execute the game and log data.
-            next_obs, reward, next_done, info = envs.step(action.cpu().numpy())
+            action_np = action.cpu().numpy()
+            action_np = stress.delay_action(action_np)
+            next_obs, reward, next_done, info = envs.step(action_np)
+            reward = stress.scale_reward(np.asarray(reward, dtype=np.float32))
             rewards[step] = torch.tensor(reward).to(device).view(-1)
             next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(next_done).to(device)
 
+            # Track true episode return on game over (terminated & lives==0)
+            ep_returns += reward
+            ep_lengths += 1
             for idx, d in enumerate(next_done):
                 if d and info["lives"][idx] == 0:
-                    print(f"global_step={global_step}, episodic_return={info['r'][idx]}")
-                    avg_returns.append(info["r"][idx])
+                    print(f"global_step={global_step}, episodic_return={ep_returns[idx]}")
+                    avg_returns.append(ep_returns[idx])
                     writer.add_scalar("charts/avg_episodic_return", np.average(avg_returns), global_step)
-                    writer.add_scalar("charts/episodic_return", info["r"][idx], global_step)
-                    writer.add_scalar("charts/episodic_length", info["l"][idx], global_step)
+                    writer.add_scalar("charts/episodic_return", ep_returns[idx], global_step)
+                    writer.add_scalar("charts/episodic_length", ep_lengths[idx], global_step)
+                    ep_returns[idx] = 0.0
+                    ep_lengths[idx] = 0
 
         # bootstrap value if not done
         with torch.no_grad():
@@ -273,7 +434,22 @@ if __name__ == "__main__":
         # Optimizing the policy and value network
         b_inds = np.arange(args.batch_size)
         clipfracs = []
-        for epoch in range(args.update_epochs):
+
+        # Rsubt: snapshot actor params before optimization
+        if rsubt_monitor is not None:
+            actor_params = list(agent.network.parameters()) + list(agent.actor.parameters())
+            rsubt_monitor.snapshot_params(actor_params)
+
+        # Rsubt: optionally apply risk-gated hyperparameters
+        current_update_epochs = args.update_epochs
+        current_clip_coef = args.clip_coef
+        if rsubt_monitor is not None and args.rsubt_control:
+            hp = rsubt_monitor.get_hyperparams()
+            if hp is not None:
+                current_update_epochs = hp.update_epochs
+                current_clip_coef = hp.clip_coef
+                optimizer.param_groups[0]["lr"] = hp.learning_rate
+        for epoch in range(current_update_epochs):
             np.random.shuffle(b_inds)
             for start in range(0, args.batch_size, args.minibatch_size):
                 end = start + args.minibatch_size
@@ -287,7 +463,7 @@ if __name__ == "__main__":
                     # calculate approx_kl http://joschu.net/blog/kl-approx.html
                     old_approx_kl = (-logratio).mean()
                     approx_kl = ((ratio - 1) - logratio).mean()
-                    clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
+                    clipfracs += [((ratio - 1.0).abs() > current_clip_coef).float().mean().item()]
 
                 mb_advantages = b_advantages[mb_inds]
                 if args.norm_adv:
@@ -295,7 +471,7 @@ if __name__ == "__main__":
 
                 # Policy loss
                 pg_loss1 = -mb_advantages * ratio
-                pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
+                pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - current_clip_coef, 1 + current_clip_coef)
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
                 # Value loss
@@ -318,6 +494,12 @@ if __name__ == "__main__":
 
                 optimizer.zero_grad()
                 loss.backward()
+                # Baseline diagnostics: gradient norms
+                actor_params_list = list(agent.network.parameters()) + list(agent.actor.parameters())
+                critic_params_list = list(agent.critic.parameters())
+                grad_norm_actor = sum(p.grad.norm().item() ** 2 for p in actor_params_list if p.grad is not None) ** 0.5
+                grad_norm_critic = sum(p.grad.norm().item() ** 2 for p in critic_params_list if p.grad is not None) ** 0.5
+
                 nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
                 optimizer.step()
 
@@ -328,6 +510,14 @@ if __name__ == "__main__":
         var_y = np.var(y_true)
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
 
+        # Rsubt: record update and compute certificate
+        if rsubt_monitor is not None:
+            actor_params = list(agent.network.parameters()) + list(agent.actor.parameters())
+            rsubt_monitor.update(actor_params, global_step)
+            rsubt_metrics = rsubt_monitor.maybe_compute(global_step)
+            if rsubt_metrics is not None:
+                rsubt_monitor.log_to_tensorboard(writer, global_step)
+
         # TRY NOT TO MODIFY: record rewards for plotting purposes
         writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
         writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
@@ -337,8 +527,26 @@ if __name__ == "__main__":
         writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
         writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
         writer.add_scalar("losses/explained_variance", explained_var, global_step)
+        writer.add_scalar("baseline/grad_norm_actor", grad_norm_actor, global_step)
+        writer.add_scalar("baseline/grad_norm_critic", grad_norm_critic, global_step)
         print("SPS:", int(global_step / (time.time() - start_time)))
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+
+        # Periodic evaluation
+        if args.eval_interval_steps > 0 and (global_step - last_eval_step) >= args.eval_interval_steps:
+            ret_mean, ret_std, len_mean = evaluate_atari_envpool(
+                agent,
+                args.env_id,
+                args.eval_episodes,
+                args.eval_seed,
+                device,
+                args.eval_deterministic,
+            )
+            writer.add_scalar("eval/return_mean", ret_mean, global_step)
+            writer.add_scalar("eval/return_std", ret_std, global_step)
+            writer.add_scalar("eval/length_mean", len_mean, global_step)
+            print(f"eval: global_step={global_step}, return_mean={ret_mean:.2f}, return_std={ret_std:.2f}")
+            last_eval_step = global_step
 
     envs.close()
     writer.close()

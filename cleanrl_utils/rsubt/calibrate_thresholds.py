@@ -10,13 +10,15 @@ Usage:
         --runs_dir runs/calibration/ \
         --target_fpr 0.05 \
         --output thresholds.json
+
+Supports calibrating multiple metrics, not just Rsubt.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -45,7 +47,8 @@ def load_scalar_from_events(
     ea = EventAccumulator(str(logdir))
     ea.Reload()
     
-    if scalar_key not in ea.Tags()["scalars"]:
+    tags = ea.Tags().get("scalars", [])
+    if scalar_key not in tags:
         return [], []
     
     events = ea.Scalars(scalar_key)
@@ -55,46 +58,89 @@ def load_scalar_from_events(
     return steps, values
 
 
-def detect_collapse(
+def compute_ema(values: list[float], alpha: float = 0.2) -> list[float]:
+    """
+    Compute exponential moving average of values.
+    
+    Args:
+        values: Input values.
+        alpha: Smoothing factor (higher = more weight on recent).
+    
+    Returns:
+        EMA-smoothed values.
+    """
+    if not values:
+        return []
+    
+    ema = [values[0]]
+    for v in values[1:]:
+        ema.append(alpha * v + (1 - alpha) * ema[-1])
+    return ema
+
+
+def detect_collapse_ema(
     steps: list[int],
     returns: list[float],
-    threshold_ratio: float = 0.2,
-    consecutive_evals: int = 3,
+    ema_window: int = 5,
+    drop_ratio: float = 0.4,
+    persistence: int = 3,
 ) -> int | None:
     """
-    Detect collapse time from return history.
+    Detect collapse time from return history using EMA-based definition.
     
     Collapse is defined as:
-    - Mean return < threshold_ratio * max_return for consecutive_evals evals.
+    - EMA(R(t)) <= (1 - drop_ratio) * R_best(t) for `persistence` consecutive evals.
+    - R_best(t) = max_{s<=t} EMA(R(s))
+    
+    This handles both positive and negative return tasks by using relative drops.
     
     Args:
         steps: Global step for each evaluation.
-        returns: Episodic return at each evaluation.
-        threshold_ratio: Fraction of peak return below which is "collapsed".
-        consecutive_evals: Number of consecutive low evals needed.
+        returns: Return at each evaluation (eval/return_mean).
+        ema_window: Window for EMA (controls alpha = 2/(w+1)).
+        drop_ratio: Fraction of peak to consider as collapse (e.g., 0.4 = 40% drop).
+        persistence: Number of consecutive eval points below threshold.
     
     Returns:
         Collapse step, or None if no collapse detected.
     """
-    if len(returns) < consecutive_evals:
+    if len(returns) < persistence:
         return None
     
-    max_return = float("-inf")
+    # Compute EMA
+    alpha = 2.0 / (ema_window + 1)
+    ema = compute_ema(returns, alpha)
+    
+    # Track running best and consecutive low counts
+    r_best = ema[0]
     low_count = 0
     
-    for i, (step, ret) in enumerate(zip(steps, returns)):
-        # Update running max
-        if ret > max_return:
-            max_return = ret
+    for i, (step, ema_val) in enumerate(zip(steps, ema)):
+        # Update running best
+        if ema_val > r_best:
+            r_best = ema_val
             low_count = 0
         else:
-            # Check if below threshold
-            threshold = threshold_ratio * max_return
-            if ret < threshold:
+            # Compute threshold based on sign of r_best
+            # For positive r_best: threshold = (1 - drop_ratio) * r_best
+            # For negative r_best: threshold = (1 + drop_ratio) * r_best (more negative)
+            if r_best > 0:
+                threshold = (1 - drop_ratio) * r_best
+                is_collapsed = ema_val < threshold
+            elif r_best < 0:
+                # For negative rewards, "collapse" means getting even more negative
+                threshold = (1 + drop_ratio) * r_best
+                is_collapsed = ema_val < threshold
+            else:
+                # r_best == 0: any significant negative is collapse
+                threshold = -abs(drop_ratio)
+                is_collapsed = ema_val < threshold
+            
+            if is_collapsed:
                 low_count += 1
-                if low_count >= consecutive_evals:
+                if low_count >= persistence:
                     # Collapse detected at the first of the consecutive low evals
-                    collapse_idx = i - consecutive_evals + 1
+                    collapse_idx = i - persistence + 1
                     return steps[collapse_idx]
             else:
                 low_count = 0
@@ -130,81 +176,206 @@ def compute_fpr_threshold(
     return float(threshold)
 
 
+def parse_run_name(run_name: str) -> dict[str, Any]:
+    """
+    Parse run name to extract env, algorithm, seed, timestamp.
+    
+    Expected format: EnvId__script_name__seed__timestamp
+    """
+    parts = run_name.split("__")
+    result = {"env": None, "algo": None, "seed": None, "timestamp": None}
+    
+    if len(parts) >= 1:
+        result["env"] = parts[0]
+    if len(parts) >= 2:
+        result["algo"] = parts[1]
+    if len(parts) >= 3:
+        try:
+            result["seed"] = int(parts[2])
+        except ValueError:
+            result["seed"] = parts[2]
+    if len(parts) >= 4:
+        result["timestamp"] = parts[3]
+    
+    return result
+
+
+def split_runs_dev_test(
+    run_dirs: list[Path],
+    dev_envs: list[str] | None = None,
+    dev_seeds: list[int] | None = None,
+    dev_ratio: float = 0.5,
+) -> tuple[list[Path], list[Path]]:
+    """
+    Split runs into dev (calibration) and test (held-out) sets.
+    
+    Args:
+        run_dirs: List of run directories.
+        dev_envs: Specific envs for dev set (if None, split by ratio).
+        dev_seeds: Specific seeds for dev set (if None, split by ratio).
+        dev_ratio: Fraction of runs for dev set if not using explicit splits.
+    
+    Returns:
+        Tuple of (dev_runs, test_runs).
+    """
+    dev_runs = []
+    test_runs = []
+    
+    for run_dir in run_dirs:
+        info = parse_run_name(run_dir.name)
+        
+        # Check explicit splits
+        if dev_envs is not None and info["env"] in dev_envs:
+            dev_runs.append(run_dir)
+        elif dev_seeds is not None and info["seed"] in dev_seeds:
+            dev_runs.append(run_dir)
+        elif dev_envs is not None or dev_seeds is not None:
+            test_runs.append(run_dir)
+        else:
+            # Random split based on seed hash
+            if info["seed"] is not None:
+                seed_hash = hash(str(info["seed"])) % 100
+                if seed_hash < dev_ratio * 100:
+                    dev_runs.append(run_dir)
+                else:
+                    test_runs.append(run_dir)
+            else:
+                # No seed info, alternate
+                if len(dev_runs) <= len(test_runs):
+                    dev_runs.append(run_dir)
+                else:
+                    test_runs.append(run_dir)
+    
+    return dev_runs, test_runs
+
+
 def calibrate_from_runs(
     runs_dir: str | Path,
-    rsubt_key: str = "rsubt/ewma",
-    return_key: str = "charts/episodic_return",
+    return_key: str = "eval/return_mean",
     target_fpr: float = 0.05,
-    collapse_threshold_ratio: float = 0.2,
+    ema_window: int = 5,
+    drop_ratio: float = 0.4,
+    persistence: int = 3,
     yellow_red_ratio: float = 2.0,
-) -> dict[str, float]:
+    metrics_to_calibrate: list[str] | None = None,
+    dev_envs: list[str] | None = None,
+    dev_seeds: list[int] | None = None,
+) -> dict[str, Any]:
     """
     Calibrate thresholds from a directory of TensorBoard runs.
     
     Args:
         runs_dir: Directory containing run subdirectories.
-        rsubt_key: TensorBoard key for Rsubt EWMA values.
-        return_key: TensorBoard key for episodic returns.
+        return_key: TensorBoard key for returns (eval/return_mean preferred).
         target_fpr: Target false positive rate.
-        collapse_threshold_ratio: Ratio for collapse detection.
+        ema_window: EMA window for collapse detection.
+        drop_ratio: Drop ratio for collapse definition.
+        persistence: Persistence for collapse definition.
         yellow_red_ratio: Ratio between red and yellow thresholds.
+        metrics_to_calibrate: List of metrics to calibrate (default: rsubt/ewma + baselines).
+        dev_envs: Specific envs for dev set.
+        dev_seeds: Specific seeds for dev set.
     
     Returns:
-        Dictionary with tau_yellow and tau_red values.
+        Dictionary with calibrated thresholds for all metrics.
     """
     runs_dir = Path(runs_dir)
     
-    non_collapse_rsubt_values = []
+    # Default metrics to calibrate
+    if metrics_to_calibrate is None:
+        metrics_to_calibrate = [
+            "rsubt/ewma",
+            "rsubt/shock",
+            "losses/approx_kl",
+            "losses/clipfrac",
+            "losses/value_loss",
+            "baseline/grad_norm_actor",
+            "losses/entropy",
+            "reprank/actor_stablerank",
+        ]
+    
+    # Get all run directories
+    all_run_dirs = [d for d in runs_dir.iterdir() if d.is_dir()]
+    
+    # Split into dev and test
+    dev_runs, test_runs = split_runs_dev_test(all_run_dirs, dev_envs, dev_seeds)
+    
+    print(f"Total runs: {len(all_run_dirs)}")
+    print(f"Dev runs: {len(dev_runs)}")
+    print(f"Test runs: {len(test_runs)}")
+    
+    # Use dev runs for calibration
+    non_collapse_metric_values = {m: [] for m in metrics_to_calibrate}
     collapse_runs = []
     non_collapse_runs = []
     
-    for run_dir in runs_dir.iterdir():
-        if not run_dir.is_dir():
-            continue
-        
+    for run_dir in dev_runs:
         # Load return data
         return_steps, return_values = load_scalar_from_events(run_dir, return_key)
         if not return_values:
-            continue
-        
-        # Load Rsubt data
-        rsubt_steps, rsubt_values = load_scalar_from_events(run_dir, rsubt_key)
-        if not rsubt_values:
+            # Fallback to training returns
+            return_steps, return_values = load_scalar_from_events(run_dir, "charts/episodic_return")
+        if not return_values:
             continue
         
         # Detect collapse
-        collapse_step = detect_collapse(
+        collapse_step = detect_collapse_ema(
             return_steps, return_values,
-            threshold_ratio=collapse_threshold_ratio,
+            ema_window=ema_window,
+            drop_ratio=drop_ratio,
+            persistence=persistence,
         )
         
         if collapse_step is None:
             # Non-collapse run: use for threshold calibration
             non_collapse_runs.append(run_dir.name)
-            non_collapse_rsubt_values.append(rsubt_values)
+            
+            # Load all metric values
+            for metric in metrics_to_calibrate:
+                metric_steps, metric_values = load_scalar_from_events(run_dir, metric)
+                if metric_values:
+                    non_collapse_metric_values[metric].append(metric_values)
         else:
             collapse_runs.append(run_dir.name)
     
-    print(f"Found {len(non_collapse_runs)} non-collapse runs for calibration")
-    print(f"Found {len(collapse_runs)} collapse runs")
+    print(f"\nDev set analysis:")
+    print(f"  Non-collapse runs for calibration: {len(non_collapse_runs)}")
+    print(f"  Collapse runs: {len(collapse_runs)}")
     
-    if not non_collapse_rsubt_values:
-        print("Warning: No non-collapse runs found. Using default thresholds.")
-        return {"tau_yellow": 0.5, "tau_red": 1.0}
-    
-    # Compute yellow threshold at target FPR
-    tau_yellow = compute_fpr_threshold(non_collapse_rsubt_values, target_fpr)
-    
-    # Red threshold is a multiple of yellow
-    tau_red = tau_yellow * yellow_red_ratio
-    
-    return {
-        "tau_yellow": tau_yellow,
-        "tau_red": tau_red,
+    # Compute thresholds for each metric
+    thresholds = {
         "target_fpr": target_fpr,
+        "n_dev_runs": len(dev_runs),
+        "n_test_runs": len(test_runs),
         "n_non_collapse_runs": len(non_collapse_runs),
         "n_collapse_runs": len(collapse_runs),
+        "collapse_config": {
+            "ema_window": ema_window,
+            "drop_ratio": drop_ratio,
+            "persistence": persistence,
+        },
+        "metrics": {},
     }
+    
+    for metric in metrics_to_calibrate:
+        values = non_collapse_metric_values[metric]
+        if values:
+            tau = compute_fpr_threshold(values, target_fpr)
+            thresholds["metrics"][metric] = {
+                "tau_yellow": tau,
+                "tau_red": tau * yellow_red_ratio,
+                "n_runs_with_metric": len(values),
+            }
+            print(f"  {metric}: tau_yellow={tau:.4f}, tau_red={tau * yellow_red_ratio:.4f}")
+        else:
+            print(f"  {metric}: No data available")
+    
+    # Legacy keys for backward compatibility
+    if "rsubt/ewma" in thresholds["metrics"]:
+        thresholds["tau_yellow"] = thresholds["metrics"]["rsubt/ewma"]["tau_yellow"]
+        thresholds["tau_red"] = thresholds["metrics"]["rsubt/ewma"]["tau_red"]
+    
+    return thresholds
 
 
 def main():
@@ -220,12 +391,8 @@ def main():
         help="Target false positive rate (default: 0.05)"
     )
     parser.add_argument(
-        "--rsubt_key", type=str, default="rsubt/ewma",
-        help="TensorBoard key for Rsubt EWMA values"
-    )
-    parser.add_argument(
-        "--return_key", type=str, default="charts/episodic_return",
-        help="TensorBoard key for episodic returns"
+        "--return_key", type=str, default="eval/return_mean",
+        help="TensorBoard key for returns (default: eval/return_mean)"
     )
     parser.add_argument(
         "--output", type=str, default="thresholds.json",
@@ -235,20 +402,53 @@ def main():
         "--yellow_red_ratio", type=float, default=2.0,
         help="Ratio between red and yellow thresholds"
     )
+    parser.add_argument(
+        "--ema_window", type=int, default=5,
+        help="EMA window for collapse detection"
+    )
+    parser.add_argument(
+        "--drop_ratio", type=float, default=0.4,
+        help="Drop ratio for collapse detection (e.g., 0.4 = 40%% drop)"
+    )
+    parser.add_argument(
+        "--persistence", type=int, default=3,
+        help="Number of consecutive eval points for collapse"
+    )
+    parser.add_argument(
+        "--dev_seeds", type=str, default=None,
+        help="Comma-separated list of seeds for dev set (e.g., '1,2,3')"
+    )
+    parser.add_argument(
+        "--dev_envs", type=str, default=None,
+        help="Comma-separated list of envs for dev set"
+    )
     
     args = parser.parse_args()
     
+    dev_seeds = None
+    if args.dev_seeds:
+        dev_seeds = [int(s) for s in args.dev_seeds.split(",")]
+    
+    dev_envs = None
+    if args.dev_envs:
+        dev_envs = [e.strip() for e in args.dev_envs.split(",")]
+    
     thresholds = calibrate_from_runs(
         runs_dir=args.runs_dir,
-        rsubt_key=args.rsubt_key,
         return_key=args.return_key,
         target_fpr=args.target_fpr,
         yellow_red_ratio=args.yellow_red_ratio,
+        ema_window=args.ema_window,
+        drop_ratio=args.drop_ratio,
+        persistence=args.persistence,
+        dev_envs=dev_envs,
+        dev_seeds=dev_seeds,
     )
     
     print(f"\nCalibrated thresholds:")
-    print(f"  tau_yellow: {thresholds['tau_yellow']:.4f}")
-    print(f"  tau_red: {thresholds['tau_red']:.4f}")
+    if "tau_yellow" in thresholds:
+        print(f"  tau_yellow (rsubt/ewma): {thresholds['tau_yellow']:.4f}")
+        print(f"  tau_red (rsubt/ewma): {thresholds['tau_red']:.4f}")
     
     with open(args.output, "w") as f:
         json.dump(thresholds, f, indent=2)

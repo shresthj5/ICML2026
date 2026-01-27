@@ -17,7 +17,7 @@ from cleanrl_utils.rsubt.sketch import Sketcher, count_parameters
 from cleanrl_utils.rsubt.buffer import UpdateBuffer
 from cleanrl_utils.rsubt.tracker import EigenTracker
 from cleanrl_utils.rsubt.certificate import RsubtCertificate, AlarmState
-from cleanrl_utils.rsubt.controller import RiskController, PPOHyperparams, SACHyperparams
+from cleanrl_utils.rsubt.controller import RiskController, PPOHyperparams, SACHyperparams, TD3Hyperparams
 
 if TYPE_CHECKING:
     from torch.utils.tensorboard import SummaryWriter
@@ -35,8 +35,10 @@ class RsubtMonitor:
         sketch_dim: Dimension of sketch space (default 8192 for MLP, 32768 for CNN).
         buffer_size: Number of updates to store (m).
         k_max: Maximum eigenvalues to track.
-        diag_interval: Compute diagnostics every N updates.
-        algorithm: "ppo" or "sac" for controller.
+        diag_interval: DEPRECATED - use diag_interval_steps instead.
+        diag_interval_steps: Compute diagnostics every N environment steps (default 20480).
+        min_buffer_entries: Minimum buffer entries before computing (default 4).
+        algorithm: "ppo", "sac", or "td3" for controller.
         device: PyTorch device.
         seed: Random seed for sketcher.
         enable_controller: Whether to enable risk-gated control.
@@ -49,7 +51,9 @@ class RsubtMonitor:
         sketch_dim: int = 8192,
         buffer_size: int = 64,
         k_max: int = 20,
-        diag_interval: int = 10,
+        diag_interval: int = 10,  # DEPRECATED, kept for backward compat
+        diag_interval_steps: int = 20480,  # NEW: step-based interval
+        min_buffer_entries: int = 4,  # NEW: minimum buffer entries for warmup
         algorithm: str = "ppo",
         device: str | torch.device = "cpu",
         seed: int = 42,
@@ -57,7 +61,9 @@ class RsubtMonitor:
         **controller_kwargs,
     ):
         self.device = torch.device(device)
-        self.diag_interval = diag_interval
+        self.diag_interval = diag_interval  # kept for backward compat
+        self.diag_interval_steps = diag_interval_steps
+        self.min_buffer_entries = min_buffer_entries
         self.enable_controller = enable_controller
         
         # Count parameters and initialize sketcher
@@ -88,6 +94,7 @@ class RsubtMonitor:
         self._update_count = 0
         self._prev_params: torch.Tensor | None = None
         self._last_metrics: dict | None = None
+        self._last_log_step: int = 0  # Track last step we logged at
     
     def snapshot_params(self, params: list[torch.nn.Parameter]) -> None:
         """
@@ -137,19 +144,35 @@ class RsubtMonitor:
         # Snapshot for next update
         self._prev_params = current_params.detach().clone()
     
-    def maybe_compute(self) -> dict | None:
+    def maybe_compute(self, global_step: int = None) -> dict | None:
         """
         Compute certificate metrics if it's time.
+        
+        Uses step-based intervals for consistent behavior regardless of num_envs.
+        
+        Args:
+            global_step: Current environment step count. If None, falls back to
+                         iteration-based logic (deprecated).
         
         Returns:
             Dictionary with metrics if computed, else None.
         """
-        # Need enough updates and at diagnostic interval
-        if self._update_count % self.diag_interval != 0:
-            return None
-        
-        if not self.buffer.is_full():
-            return None
+        # Step-based logic (preferred)
+        if global_step is not None:
+            # Need minimum buffer entries for eigenvalue computation
+            if self.buffer.size() < self.min_buffer_entries:
+                return None
+            
+            # Check if enough steps have passed since last log
+            if global_step - self._last_log_step < self.diag_interval_steps:
+                return None
+        else:
+            # Legacy iteration-based logic (deprecated, for backward compat)
+            if self._update_count % self.diag_interval != 0:
+                return None
+            
+            if not self.buffer.is_full():
+                return None
         
         # Get all sketches
         sketches, norms, indices = self.buffer.get_all()
@@ -184,13 +207,16 @@ class RsubtMonitor:
         }
         
         self._last_metrics = metrics
+        # Update last log step for step-based interval tracking
+        if global_step is not None:
+            self._last_log_step = global_step
         return metrics
     
     def alarm_state(self) -> AlarmState:
         """Get current alarm state."""
         return self.certificate.state
     
-    def get_hyperparams(self) -> PPOHyperparams | SACHyperparams | None:
+    def get_hyperparams(self) -> PPOHyperparams | SACHyperparams | TD3Hyperparams | None:
         """
         Get risk-adjusted hyperparameters.
         
@@ -243,3 +269,4 @@ class RsubtMonitor:
         self._update_count = 0
         self._prev_params = None
         self._last_metrics = None
+        self._last_log_step = 0

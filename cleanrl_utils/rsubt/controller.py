@@ -30,6 +30,15 @@ class SACHyperparams:
     skip_actor: bool = False  # skip actor updates entirely this step
 
 
+@dataclass
+class TD3Hyperparams:
+    """Hyperparameters that can be modified for TD3."""
+    actor_lr: float
+    policy_frequency: int  # actor update every N critic updates
+    skip_actor: bool = False  # skip actor updates entirely this step
+    exploration_noise: float = 0.1  # can reduce noise when unstable
+
+
 class RiskController:
     """
     Risk-gated hyperparameter controller.
@@ -40,11 +49,12 @@ class RiskController:
     - RED: Aggressive reduction, potentially skip actor updates.
     
     Args:
-        algorithm: Either "ppo" or "sac".
-        base_lr: Base learning rate (for PPO shared, for SAC actor).
+        algorithm: Either "ppo", "sac", or "td3".
+        base_lr: Base learning rate (for PPO shared, for SAC/TD3 actor).
         base_epochs: Base PPO epochs (only for PPO).
         base_clip: Base PPO clip coefficient (only for PPO).
-        base_policy_freq: Base SAC policy frequency (only for SAC).
+        base_policy_freq: Base SAC/TD3 policy frequency (only for SAC/TD3).
+        base_exploration_noise: Base TD3 exploration noise (only for TD3).
         yellow_lr_mult: LR multiplier for yellow state.
         red_lr_mult: LR multiplier for red state.
         yellow_epoch_reduction: Epochs to subtract in yellow.
@@ -61,6 +71,7 @@ class RiskController:
         base_epochs: int = 10,
         base_clip: float = 0.2,
         base_policy_freq: int = 2,
+        base_exploration_noise: float = 0.1,
         yellow_lr_mult: float = 0.7,
         red_lr_mult: float = 0.3,
         yellow_epoch_reduction: int = 2,
@@ -74,6 +85,7 @@ class RiskController:
         self.base_epochs = base_epochs
         self.base_clip = base_clip
         self.base_policy_freq = base_policy_freq
+        self.base_exploration_noise = base_exploration_noise
         
         self.yellow_lr_mult = yellow_lr_mult
         self.red_lr_mult = red_lr_mult
@@ -87,7 +99,7 @@ class RiskController:
         self._red_count = 0
         self._current_state = AlarmState.GREEN
     
-    def get_hyperparams(self, state: AlarmState) -> PPOHyperparams | SACHyperparams:
+    def get_hyperparams(self, state: AlarmState) -> PPOHyperparams | SACHyperparams | TD3Hyperparams:
         """
         Get modified hyperparameters based on alarm state.
         
@@ -106,6 +118,8 @@ class RiskController:
         
         if self.algorithm == "ppo":
             return self._get_ppo_hyperparams(state)
+        elif self.algorithm == "td3":
+            return self._get_td3_hyperparams(state)
         else:
             return self._get_sac_hyperparams(state)
     
@@ -166,6 +180,42 @@ class RiskController:
                 actor_lr=lr,
                 policy_frequency=self.base_policy_freq * 2,
                 skip_actor=skip,
+            )
+    
+    def _get_td3_hyperparams(self, state: AlarmState) -> TD3Hyperparams:
+        """Compute TD3 hyperparameters for given state."""
+        if state == AlarmState.GREEN:
+            return TD3Hyperparams(
+                actor_lr=self.base_lr,
+                policy_frequency=self.base_policy_freq,
+                skip_actor=False,
+                exploration_noise=self.base_exploration_noise,
+            )
+        
+        elif state == AlarmState.YELLOW:
+            lr = max(self.base_lr * self.yellow_lr_mult,
+                     self.base_lr * self.min_lr_mult)
+            # Reduce exploration noise slightly when unstable
+            noise = self.base_exploration_noise * 0.8
+            return TD3Hyperparams(
+                actor_lr=lr,
+                policy_frequency=self.base_policy_freq * 2,  # slower actor updates
+                skip_actor=False,
+                exploration_noise=noise,
+            )
+        
+        else:  # RED
+            lr = max(self.base_lr * self.red_lr_mult,
+                     self.base_lr * self.min_lr_mult)
+            # Skip actor for first N iterations in red
+            skip = self._red_count <= self.red_skip_steps
+            # Further reduce noise in red state
+            noise = self.base_exploration_noise * 0.5
+            return TD3Hyperparams(
+                actor_lr=lr,
+                policy_frequency=self.base_policy_freq * 2,
+                skip_actor=skip,
+                exploration_noise=noise,
             )
     
     def reset(self) -> None:

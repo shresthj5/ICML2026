@@ -81,7 +81,11 @@ class Args:
     rsubt_k_max: int = 20
     """maximum number of eigenvalues to track"""
     rsubt_diag_interval: int = 1
-    """compute Rsubt diagnostics every N iterations"""
+    """DEPRECATED: compute Rsubt diagnostics every N iterations (use diag_interval_steps instead)"""
+    rsubt_diag_interval_steps: int = 20480
+    """compute Rsubt diagnostics every N environment steps (step-based, consistent across num_envs)"""
+    rsubt_min_buffer_entries: int = 4
+    """minimum buffer entries before computing Rsubt (controls warmup speed)"""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -210,6 +214,8 @@ if __name__ == "__main__":
             buffer_size=args.rsubt_buffer_size,
             k_max=args.rsubt_k_max,
             diag_interval=args.rsubt_diag_interval,
+            diag_interval_steps=args.rsubt_diag_interval_steps,
+            min_buffer_entries=args.rsubt_min_buffer_entries,
             algorithm="ppo",
             device=device,
             seed=args.seed,
@@ -371,7 +377,7 @@ if __name__ == "__main__":
         if rsubt_monitor is not None:
             actor_params = list(agent.actor.parameters())
             rsubt_monitor.update(actor_params, global_step)
-            rsubt_metrics = rsubt_monitor.maybe_compute()
+            rsubt_metrics = rsubt_monitor.maybe_compute(global_step)
             if rsubt_metrics is not None:
                 rsubt_monitor.log_to_tensorboard(writer, global_step)
 
