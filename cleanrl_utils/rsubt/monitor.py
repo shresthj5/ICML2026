@@ -11,6 +11,9 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import json
+from pathlib import Path
+
 import torch
 
 from cleanrl_utils.rsubt.sketch import Sketcher, count_parameters
@@ -58,6 +61,9 @@ class RsubtMonitor:
         device: str | torch.device = "cpu",
         seed: int = 42,
         enable_controller: bool = True,
+        tau_yellow: float | None = None,
+        tau_red: float | None = None,
+        thresholds_path: str | Path | None = None,
         **controller_kwargs,
     ):
         self.device = torch.device(device)
@@ -83,6 +89,12 @@ class RsubtMonitor:
         
         # Initialize certificate
         self.certificate = RsubtCertificate()
+        if thresholds_path is not None and str(thresholds_path):
+            self.load_thresholds(thresholds_path)
+        if (tau_yellow is None) ^ (tau_red is None):
+            raise ValueError("tau_yellow and tau_red must be set together, or both left as None")
+        if tau_yellow is not None and tau_red is not None:
+            self.set_thresholds(tau_yellow=tau_yellow, tau_red=tau_red)
         
         # Initialize controller
         if enable_controller:
@@ -215,6 +227,34 @@ class RsubtMonitor:
     def alarm_state(self) -> AlarmState:
         """Get current alarm state."""
         return self.certificate.state
+
+    def set_thresholds(self, tau_yellow: float, tau_red: float) -> None:
+        """Set certificate thresholds (overrides defaults)."""
+        self.certificate.set_thresholds(tau_yellow=tau_yellow, tau_red=tau_red)
+
+    def load_thresholds(self, thresholds_path: str | Path, metric_key: str = "rsubt/ewma") -> None:
+        """
+        Load thresholds from a JSON file produced by `cleanrl_utils.rsubt.calibrate_thresholds`.
+        
+        Supports either:
+        - Top-level keys: {"tau_yellow": ..., "tau_red": ...}
+        - Per-metric keys: {"metrics": {"rsubt/ewma": {"tau_yellow": ..., "tau_red": ...}}}
+        """
+        path = Path(thresholds_path)
+        with path.open("r") as f:
+            data = json.load(f)
+        tau_yellow = data.get("tau_yellow")
+        tau_red = data.get("tau_red")
+        if tau_yellow is None or tau_red is None:
+            metric = (data.get("metrics") or {}).get(metric_key) or {}
+            tau_yellow = metric.get("tau_yellow", tau_yellow)
+            tau_red = metric.get("tau_red", tau_red)
+        if tau_yellow is None or tau_red is None:
+            raise ValueError(
+                f"Thresholds file {path} missing tau_yellow/tau_red "
+                f"(looked for top-level keys and metrics['{metric_key}'])"
+            )
+        self.set_thresholds(tau_yellow=float(tau_yellow), tau_red=float(tau_red))
     
     def get_hyperparams(self) -> PPOHyperparams | SACHyperparams | TD3Hyperparams | None:
         """

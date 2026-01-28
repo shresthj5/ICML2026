@@ -90,6 +90,12 @@ class Args:
     """compute Rsubt diagnostics every N environment steps (step-based, consistent across num_envs)"""
     rsubt_min_buffer_entries: int = 4
     """minimum buffer entries before computing Rsubt (controls warmup speed)"""
+    rsubt_tau_yellow: float = 0.5
+    """Rsubt EWMA threshold for YELLOW state (calibrate or override)"""
+    rsubt_tau_red: float = 1.0
+    """Rsubt EWMA threshold for RED state (calibrate or override)"""
+    rsubt_thresholds: str = ""
+    """optional path to thresholds JSON from `python -m cleanrl_utils.rsubt.calibrate_thresholds` (overrides tau_yellow/tau_red)"""
 
     # Periodic evaluation arguments
     eval_interval_steps: int = 50000
@@ -344,6 +350,9 @@ if __name__ == "__main__":
             device=device,
             seed=args.seed,
             enable_controller=args.rsubt_control,
+            thresholds_path=args.rsubt_thresholds if args.rsubt_thresholds else None,
+            tau_yellow=None if args.rsubt_thresholds else args.rsubt_tau_yellow,
+            tau_red=None if args.rsubt_thresholds else args.rsubt_tau_red,
             base_lr=args.learning_rate,
             base_epochs=args.update_epochs,
             base_clip=args.clip_coef,
